@@ -60,3 +60,4 @@ mini-swe-agent/
 result
 UNKNOWN.egg-info/
 webapi/
+.gitleaks-baseline.json
