@@ -58,3 +58,5 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+UNKNOWN.egg-info/
+webapi/
