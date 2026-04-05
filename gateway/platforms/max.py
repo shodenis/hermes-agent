@@ -3,6 +3,7 @@ MAX (max.ru) platform adapter for Hermes Agent.
 Uses MAX Bot API (platform-api.max.ru) with Long Polling.
 """
 import asyncio
+import json
 import logging
 import os
 import re
@@ -20,6 +21,8 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
+from hermes_constants import get_hermes_home
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -34,9 +37,13 @@ from gateway.platforms.base import (
 import sqlite3
 import time as _time_module
 
+_MAX_DEDUP_DB_PATH = get_hermes_home() / "max_dedup.db"
+
+
 class _MessageDedup:
-    def __init__(self, db_path="/root/.hermes/max_dedup.db", ttl=300):
-        self.db = sqlite3.connect(db_path, check_same_thread=False)
+    def __init__(self, db_path=None, ttl=300):
+        path = _MAX_DEDUP_DB_PATH if db_path is None else db_path
+        self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS seen (mid TEXT PRIMARY KEY, ts REAL)")
         self.db.commit()
         self.ttl = ttl
@@ -352,18 +359,38 @@ class MaxAdapter(BasePlatformAdapter):
                     params={"chat_id": chat_id},
                     json=payload,
                 ) as resp:
-                    body = await resp.text()
+                    raw = await resp.read()
+                    err_preview = (
+                        raw.decode("utf-8", errors="replace")[:1000] if raw else ""
+                    )
                     if resp.status == 200:
                         try:
-                            data = await resp.json()
-                        except Exception:
-                            data = None
-                        if data and data.get("message"):
-                            last_result = SendResult(success=True, message_id=str(data["message"].get("mid", "")))
+                            data = json.loads(raw.decode("utf-8") or "{}")
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            data = {}
+                        msg = data.get("message") if isinstance(data, dict) else None
+                        success = bool(
+                            data.get("ok")
+                            or data.get("message_id") is not None
+                            or (isinstance(msg, dict) and msg)
+                        )
+                        if success and isinstance(msg, dict):
+                            last_result = SendResult(
+                                success=True,
+                                message_id=str(msg.get("mid", "")),
+                            )
+                        elif success:
+                            last_result = SendResult(
+                                success=True,
+                                message_id=str(data.get("message_id", "")),
+                            )
                         else:
-                            last_result = SendResult(success=False, error=str(data))
+                            last_result = SendResult(
+                                success=False,
+                                error=str(data) if data else err_preview,
+                            )
                     else:
-                        last_result = SendResult(success=False, error=body[:1000])
+                        last_result = SendResult(success=False, error=err_preview)
             except Exception as e:
                 last_result = SendResult(success=False, error=str(e))
 
@@ -381,7 +408,7 @@ class MaxAdapter(BasePlatformAdapter):
         "🧩 Собираю ответ... Венеция стоит на 118 островах и 400+ мостах",
         "🎲 Финальный штрих... бананы на 60% генетически совпадают с человеком",
     ]
-    _THINKING_USAGE_PATH = "/root/.hermes/thinking_usage.json"
+    _THINKING_USAGE_PATH = get_hermes_home() / "thinking_usage.json"
     _THINKING_MAX_PER_MONTH = 3
 
     @classmethod
