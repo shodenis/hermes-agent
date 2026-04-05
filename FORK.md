@@ -19,31 +19,37 @@ git branch -f upstream-tracking upstream/main
 
 ## What we fork
 
-1. **MAX (VK Teams / max.ru)** — `gateway/platforms/max.py`, gateway registration in `gateway/run.py`, `Platform.MAX` in `gateway/config.py`, `send_message` extensions.
+1. **MAX (VK Teams / max.ru)** — `gateway/platforms/max.py`, gateway registration in `gateway/run.py`, `Platform.MAX` in `gateway/config.py`, `send_message` extensions, `hermes-max` toolset + `PLATFORMS.max` in `toolsets.py` / `hermes_cli/tools_config.py`.
 2. **Outbound email sanitizer** — `gateway/platforms/email.py` strips problematic content before SMTP.
-3. **Merge resolutions** — Prior cherry-picks were squashed into `feat(fork): MAX platform…`; email fix is `fix(fork): sanitize outbound email…`.
+3. **Agent / gateway guardrails** — e.g. `run_agent.py` identical-tool loop abort; `api_server` / gateway default `HERMES_MAX_ITERATIONS` aligned with prod policy.
+4. **Merge resolutions** — Prior cherry-picks were squashed into `feat(fork): MAX platform…`; email fix is `fix(fork): sanitize outbound email…`.
 
-Regenerate patches any time `prod` changes relative to `upstream-tracking`:
+Regenerate patches any time `prod` changes relative to **`upstream/main`** (or `upstream-tracking` after `git branch -f upstream-tracking upstream/main`):
 
 ```bash
 cd /root/.hermes/hermes-agent
 mkdir -p /root/.hermes/hooks/post-update/patches
-git diff upstream-tracking..prod -- gateway/config.py   > /root/.hermes/hooks/post-update/patches/10-config-max.patch
-git diff upstream-tracking..prod -- gateway/run.py      > /root/.hermes/hooks/post-update/patches/20-run-max.patch
-git diff upstream-tracking..prod -- gateway/platforms/max.py   > /root/.hermes/hooks/post-update/patches/30-max-py.patch
-git diff upstream-tracking..prod -- gateway/platforms/email.py > /root/.hermes/hooks/post-update/patches/40-email-sanitize.patch
+P=/root/.hermes/hooks/post-update/patches
+git diff upstream/main HEAD -- gateway/config.py              > "$P/10-config-max.patch"
+git diff upstream/main HEAD -- gateway/run.py                 > "$P/20-run-max.patch"
+git diff upstream/main HEAD -- gateway/platforms/max.py       > "$P/30-max-py.patch"
+git diff upstream/main HEAD -- hermes_cli/tools_config.py toolsets.py > "$P/35-tools-max.patch"
+git diff upstream/main HEAD -- gateway/platforms/email.py     > "$P/40-email-sanitize.patch"
+git diff upstream/main HEAD -- run_agent.py gateway/platforms/api_server.py > "$P/50-agent-guardrails.patch"
 ```
 
 ## Patch pipeline (optional re-apply)
 
 Patches are a **replay aid** if you ever need to re-apply the same edits onto a clean upstream tree (e.g. new clone or conflict recovery). They are **not** run automatically by `hermes-auto-update.sh` (that script **merges** `upstream-tracking` into `prod`).
 
-| Patch | File |
-|-------|------|
+| Patch | File(s) |
+|-------|---------|
 | `10-config-max.patch` | `gateway/config.py` |
 | `20-run-max.patch` | `gateway/run.py` |
 | `30-max-py.patch` | `gateway/platforms/max.py` |
+| `35-tools-max.patch` | `hermes_cli/tools_config.py`, `toolsets.py` |
 | `40-email-sanitize.patch` | `gateway/platforms/email.py` |
+| `50-agent-guardrails.patch` | `run_agent.py`, `gateway/platforms/api_server.py` |
 
 Apply in order:
 
@@ -57,7 +63,7 @@ Override paths if needed:
 HERMES_AGENT_REPO=/path/to/hermes-agent HERMES_PATCH_DIR=/path/to/patches /root/.hermes/hooks/post-update/apply.sh
 ```
 
-The script uses `patch -p1 --dry-run` first; if hunks are already present it prints `Already applied or conflict` and continues.
+`apply.sh` applies `*.patch` in lexical order: forward dry-run → apply, else reverse dry-run → “already applied”, else **exits 1** (real conflict — fix manually).
 
 ## Automated upstream sync
 
@@ -92,4 +98,4 @@ journalctl -u hermes-bitrix --since "10 min ago" | grep -E "ERROR|Exception|Trac
 
 ---
 
-*Last aligned with production workflow: `prod` = `upstream/main` + squashed MAX + email sanitizer; patch files generated from `git diff upstream-tracking..prod`.*
+*Last aligned: `prod` ahead of `upstream/main` with MAX, email sanitizer, tools/agent guardrails; patch files generated from `git diff upstream/main HEAD` into `~/.hermes/hooks/post-update/patches/`.*
