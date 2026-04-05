@@ -43,6 +43,41 @@ from gateway.platforms.base import (
 from gateway.config import Platform, PlatformConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_outbound_email_body(text: str) -> str:
+    """Remove tool/agent leakage from plain-text bodies before SMTP.
+
+    Models sometimes emit <tool_call>, execute_code, or curl snippets in the
+    final assistant string; those must never reach the client's inbox.
+    """
+    if not text or not isinstance(text, str):
+        return (text or "").strip() if isinstance(text, str) else ""
+    t = re.sub(r"<tool_call>\s*[\s\S]*?</tool_call>", "", text, flags=re.IGNORECASE).strip()
+    markers = (
+        "<tool_call>",
+        "execute_code",
+        "curl ",
+        "platform-api.max.ru",
+        "<parameter=code>",
+        "</function>",
+        "<function=",
+    )
+    lower = t.lower()
+    for m in markers:
+        pos = lower.find(m.lower())
+        if pos != -1:
+            t = t[:pos].strip()
+            lower = t.lower()
+    t = t.strip()
+    if not t:
+        return (
+            "Добрый день. Не удалось сформировать корректный ответ. "
+            "Пожалуйста, кратко повторите запрос и укажите все поля заявки."
+        )
+    return t
+
+
 # Automated sender patterns — emails from these are silently ignored
 _NOREPLY_PATTERNS = (
     "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
@@ -467,6 +502,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an email reply to the given address."""
         try:
+            content = _sanitize_outbound_email_body(content)
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
                 None, self._send_email, chat_id, content, reply_to
