@@ -643,6 +643,10 @@ class AIAgent:
         # status_callback for gateway platforms.  Does NOT inject into messages.
         self._context_pressure_warned = False
 
+        # Detect identical tool batches across consecutive turns (infinite loop guard).
+        self._identical_tool_batch_fingerprint: Optional[str] = None
+        self._identical_tool_batch_count = 0
+
         # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
         # so tool failures, API errors, etc. are inspectable after the fact.
         # In gateway mode, each incoming message creates a new AIAgent instance,
@@ -5791,6 +5795,32 @@ class AIAgent:
 
         return compressed, new_system_prompt
 
+    def _tool_batch_loop_fingerprint(self, tool_calls) -> Optional[str]:
+        """Stable signature of a tool batch for consecutive-duplicate detection."""
+        if not tool_calls:
+            return None
+        parts: List[str] = []
+        for tc in tool_calls:
+            fn = getattr(tc, "function", None)
+            name = getattr(fn, "name", "") or ""
+            args_raw = getattr(fn, "arguments", None)
+            if args_raw is None:
+                norm = "{}"
+            elif isinstance(args_raw, (dict, list)):
+                norm = json.dumps(args_raw, sort_keys=True, ensure_ascii=False)
+            else:
+                s = str(args_raw).strip() if args_raw else ""
+                if not s:
+                    norm = "{}"
+                else:
+                    try:
+                        parsed = json.loads(s)
+                        norm = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        norm = s
+            parts.append(f"{name}\x1f{norm}")
+        return "\x1e".join(parts)
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
@@ -8423,6 +8453,17 @@ class AIAgent:
                         assistant_message.tool_calls
                     )
 
+                    _loop_fp = self._tool_batch_loop_fingerprint(assistant_message.tool_calls)
+                    _abort_identical_tool_batch = False
+                    if _loop_fp:
+                        if _loop_fp == self._identical_tool_batch_fingerprint:
+                            self._identical_tool_batch_count += 1
+                        else:
+                            self._identical_tool_batch_fingerprint = _loop_fp
+                            self._identical_tool_batch_count = 1
+                        if self._identical_tool_batch_count >= 3:
+                            _abort_identical_tool_batch = True
+
                     assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
                     # If this turn has both content AND tool_calls, capture the content
@@ -8464,6 +8505,31 @@ class AIAgent:
                             self.stream_delta_callback(None)
                         except Exception:
                             pass
+
+                    if _abort_identical_tool_batch:
+                        self._vprint(
+                            f"{self.log_prefix}⚠️  Identical tool batch repeated 3× — "
+                            "skipping execution (possible infinite loop).",
+                            force=True,
+                        )
+                        _abort_tool_msg = (
+                            "Error: The same tool call(s) with identical arguments were "
+                            "invoked 3 times in a row. Execution was skipped. Do not retry "
+                            "the same command; summarize what you know for the user."
+                        )
+                        for tc in assistant_message.tool_calls:
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": _abort_tool_msg,
+                            })
+                        self._identical_tool_batch_fingerprint = None
+                        self._identical_tool_batch_count = 0
+                        self._stream_needs_break = True
+                        _tc_abort = {tc.function.name for tc in assistant_message.tool_calls}
+                        if _tc_abort == {"execute_code"}:
+                            self.iteration_budget.refund()
+                        continue
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
