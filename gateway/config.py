@@ -26,6 +26,10 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
         return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
     if isinstance(value, str):
         lowered = value.strip().lower()
         if lowered in ("true", "1", "yes", "on"):
@@ -63,6 +67,7 @@ class Platform(Enum):
     WEBHOOK = "webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
+    MAX = "max"
 
 
 @dataclass

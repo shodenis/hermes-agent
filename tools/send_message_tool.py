@@ -133,6 +133,7 @@ def _handle_send(args):
         "wecom": Platform.WECOM,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "max": Platform.MAX,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -286,6 +287,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.platforms.telegram import TelegramAdapter
     from gateway.platforms.discord import DiscordAdapter
     from gateway.platforms.slack import SlackAdapter
+    from gateway.platforms.max import MaxAdapter, MAX_MESSAGE_LENGTH
 
     # Feishu adapter import is optional (requires lark-oapi)
     try:
@@ -301,6 +303,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
         Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
+        Platform.MAX: MAX_MESSAGE_LENGTH,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
@@ -371,6 +374,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.MAX:
+            result = await _send_max(pconfig.token, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -904,3 +909,24 @@ registry.register(
     check_fn=_check_send_message,
     emoji="📨",
 )
+
+
+async def _send_max(token, chat_id, message):
+    """Send via MAX (VK Teams / Mail.ru) Bot API."""
+    try:
+        import aiohttp
+        url = "https://platform-api.max.ru/messages"
+        headers = {
+            "Authorization": token or os.getenv("MAX_BOT_TOKEN", ""),
+            "Content-Type": "application/json",
+        }
+        payload = {"text": message, "notify": True}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, params={"chat_id": chat_id}, json=payload) as resp:
+                if resp.status == 200:
+                    return {"success": True, "platform": "max", "chat_id": chat_id}
+                else:
+                    text = await resp.text()
+                    return {"error": f"MAX API error {resp.status}: {text}"}
+    except Exception as e:
+        return {"error": f"MAX send failed: {e}"}
