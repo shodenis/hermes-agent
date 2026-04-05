@@ -285,6 +285,15 @@ PLATFORM_HINTS = {
         "only — no markdown, no formatting. SMS messages are limited to ~1600 "
         "characters, so be brief and direct."
     ),
+    "max": (
+        "You are on a messaging platform MAX (VK Teams / Mail.ru). "
+        "Please do not use markdown as it does not render. "
+        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "in your response. Images appear as photos, audio as voice messages. "
+        "To send messages to channels or other chats, use the send_message tool "
+        "with target='max:CHAT_ID' or target='max' for the home channel. "
+        "Your home channel is Spare24 (chat_id: -72597598792341)."
+    ),
 }
 
 CONTEXT_FILE_MAX_CHARS = 20_000
