@@ -205,6 +205,11 @@ DEFAULT_CONFIG = {
     "toolsets": ["hermes-cli"],
     "agent": {
         "max_turns": 90,
+        # Inactivity timeout for gateway agent execution (seconds).
+        # The agent can run indefinitely as long as it's actively calling
+        # tools or receiving API responses.  Only fires when the agent has
+        # been completely idle for this duration.  0 = unlimited.
+        "gateway_timeout": 1800,
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -315,7 +320,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 30,         # seconds — increase for slow local models
+            "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
         },
         "compression": {
             "provider": "auto",
@@ -1898,6 +1903,51 @@ def save_env_value(key: str, value: str):
             os.chmod(env_path, stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
             pass
+
+
+def remove_env_value(key: str) -> bool:
+    """Remove a key from ~/.hermes/.env and os.environ.
+
+    Returns True if the key was found and removed, False otherwise.
+    """
+    if is_managed():
+        managed_error(f"remove {key}")
+        return False
+    if not _ENV_VAR_NAME_RE.match(key):
+        raise ValueError(f"Invalid environment variable name: {key!r}")
+    env_path = get_env_path()
+    if not env_path.exists():
+        os.environ.pop(key, None)
+        return False
+
+    read_kw = {"encoding": "utf-8", "errors": "replace"} if _IS_WINDOWS else {}
+    write_kw = {"encoding": "utf-8"} if _IS_WINDOWS else {}
+
+    with open(env_path, **read_kw) as f:
+        lines = f.readlines()
+    lines = _sanitize_env_lines(lines)
+
+    new_lines = [line for line in lines if not line.strip().startswith(f"{key}=")]
+    found = len(new_lines) < len(lines)
+
+    if found:
+        fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
+        try:
+            with os.fdopen(fd, 'w', **write_kw) as f:
+                f.writelines(new_lines)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, env_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        _secure_file(env_path)
+
+    os.environ.pop(key, None)
+    return found
 
 
 def save_anthropic_oauth_token(value: str, save_fn=None):

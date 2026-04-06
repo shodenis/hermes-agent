@@ -52,6 +52,25 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Non-agentic model warning
+# ---------------------------------------------------------------------------
+
+_HERMES_MODEL_WARNING = (
+    "Nous Research Hermes 3 & 4 models are NOT agentic and are not designed "
+    "for use with Hermes Agent. They lack the tool-calling capabilities "
+    "required for agent workflows. Consider using an agentic model instead "
+    "(Claude, GPT, Gemini, DeepSeek, etc.)."
+)
+
+
+def _check_hermes_model_warning(model_name: str) -> str:
+    """Return a warning string if *model_name* looks like a Hermes LLM model."""
+    if "hermes" in model_name.lower():
+        return _HERMES_MODEL_WARNING
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Model aliases -- short names -> (vendor, family) with NO version numbers.
 # Resolved dynamically against the live models.dev catalog.
 # ---------------------------------------------------------------------------
@@ -112,6 +131,71 @@ MODEL_ALIASES: dict[str, ModelIdentity] = {
     # Arcee
     "trinity":   ModelIdentity("arcee-ai", "trinity"),
 }
+
+
+# ---------------------------------------------------------------------------
+# Direct aliases — exact model+provider+base_url for endpoints that aren't
+# in the models.dev catalog (e.g. Ollama Cloud, local servers).
+# Checked BEFORE catalog resolution.  Format:
+#   alias -> (model_id, provider, base_url)
+# These can also be loaded from config.yaml ``model_aliases:`` section.
+# ---------------------------------------------------------------------------
+
+class DirectAlias(NamedTuple):
+    """Exact model mapping that bypasses catalog resolution."""
+    model: str
+    provider: str
+    base_url: str
+
+
+# Built-in direct aliases (can be extended via config.yaml model_aliases:)
+_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
+
+# Merged dict (builtins + user config); populated by _load_direct_aliases()
+DIRECT_ALIASES: dict[str, DirectAlias] = {}
+
+
+def _load_direct_aliases() -> dict[str, DirectAlias]:
+    """Load direct aliases from config.yaml ``model_aliases:`` section.
+
+    Config format::
+
+        model_aliases:
+          qwen:
+            model: "qwen3.5:397b"
+            provider: custom
+            base_url: "https://ollama.com/v1"
+          minimax:
+            model: "minimax-m2.7"
+            provider: custom
+            base_url: "https://ollama.com/v1"
+    """
+    merged = dict(_BUILTIN_DIRECT_ALIASES)
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        user_aliases = cfg.get("model_aliases")
+        if isinstance(user_aliases, dict):
+            for name, entry in user_aliases.items():
+                if not isinstance(entry, dict):
+                    continue
+                model = entry.get("model", "")
+                provider = entry.get("provider", "custom")
+                base_url = entry.get("base_url", "")
+                if model:
+                    merged[name.strip().lower()] = DirectAlias(
+                        model=model, provider=provider, base_url=base_url,
+                    )
+    except Exception:
+        pass
+    return merged
+
+
+def _ensure_direct_aliases() -> None:
+    """Lazy-load direct aliases on first use."""
+    global DIRECT_ALIASES
+    if not DIRECT_ALIASES:
+        DIRECT_ALIASES = _load_direct_aliases()
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +295,20 @@ def resolve_alias(
         exist or no matching model is available.
     """
     key = raw_input.strip().lower()
+
+    # Check direct aliases first (exact model+provider+base_url mappings)
+    _ensure_direct_aliases()
+    direct = DIRECT_ALIASES.get(key)
+    if direct is not None:
+        return (direct.provider, direct.model, key)
+
+    # Reverse lookup: match by model ID so full names (e.g. "kimi-k2.5",
+    # "glm-4.7") route through direct aliases instead of falling through
+    # to the catalog/OpenRouter.
+    for alias_name, da in DIRECT_ALIASES.items():
+        if da.model.lower() == key:
+            return (da.provider, da.model, alias_name)
+
     identity = MODEL_ALIASES.get(key)
     if identity is None:
         return None
@@ -487,6 +585,15 @@ def switch_model(
         except Exception:
             pass
 
+    # --- Direct alias override: use exact base_url from the alias if set ---
+    if resolved_alias:
+        _ensure_direct_aliases()
+        _da = DIRECT_ALIASES.get(resolved_alias)
+        if _da is not None and _da.base_url:
+            base_url = _da.base_url
+            if not api_key:
+                api_key = "no-key-required"
+
     # --- Normalize model name for target provider ---
     new_model = normalize_model_for_provider(new_model, target_provider)
 
@@ -531,6 +638,14 @@ def switch_model(
     # --- Get full model info from models.dev ---
     model_info = get_model_info(target_provider, new_model)
 
+    # --- Collect warnings ---
+    warnings: list[str] = []
+    if validation.get("message"):
+        warnings.append(validation["message"])
+    hermes_warn = _check_hermes_model_warning(new_model)
+    if hermes_warn:
+        warnings.append(hermes_warn)
+
     # --- Build result ---
     return ModelSwitchResult(
         success=True,
@@ -540,7 +655,7 @@ def switch_model(
         api_key=api_key,
         base_url=base_url,
         api_mode=api_mode,
-        warning_message=validation.get("message") or "",
+        warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,
         capabilities=capabilities,

@@ -88,6 +88,7 @@ from agent.model_metadata import (
     save_context_length, is_local_endpoint,
 )
 from agent.context_compressor import ContextCompressor
+from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
@@ -405,6 +406,68 @@ def _strip_budget_warnings_from_history(messages: list) -> None:
             msg["content"] = cleaned
 
 
+# =========================================================================
+# Large tool result handler — save oversized output to temp file
+# =========================================================================
+
+# Threshold at which tool results are saved to a file instead of kept inline.
+# 100K chars ≈ 25K tokens — generous for any reasonable output but prevents
+# catastrophic context explosions.
+_LARGE_RESULT_CHARS = 100_000
+
+# How many characters of the original result to include as an inline preview
+# so the model has immediate context about what the tool returned.
+_LARGE_RESULT_PREVIEW_CHARS = 1_500
+
+
+def _save_oversized_tool_result(function_name: str, function_result: str) -> str:
+    """Replace oversized tool results with a file reference + preview.
+
+    When a tool returns more than ``_LARGE_RESULT_CHARS`` characters, the full
+    content is written to a temporary file under ``HERMES_HOME/cache/tool_responses/``
+    and the result sent to the model is replaced with:
+      • a brief head preview  (first ``_LARGE_RESULT_PREVIEW_CHARS`` chars)
+      • the file path so the model can use ``read_file`` / ``search_files``
+
+    Falls back to destructive truncation if the file write fails.
+    """
+    original_len = len(function_result)
+    if original_len <= _LARGE_RESULT_CHARS:
+        return function_result
+
+    # Build the target directory
+    try:
+        response_dir = os.path.join(get_hermes_home(), "cache", "tool_responses")
+        os.makedirs(response_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        # Sanitize tool name for use in filename
+        safe_name = re.sub(r"[^\w\-]", "_", function_name)[:40]
+        filename = f"{safe_name}_{timestamp}.txt"
+        filepath = os.path.join(response_dir, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(function_result)
+
+        preview = function_result[:_LARGE_RESULT_PREVIEW_CHARS]
+        return (
+            f"{preview}\n\n"
+            f"[Large tool response: {original_len:,} characters total — "
+            f"only the first {_LARGE_RESULT_PREVIEW_CHARS:,} shown above. "
+            f"Full output saved to: {filepath}\n"
+            f"Use read_file or search_files on that path to access the rest.]"
+        )
+    except Exception as exc:
+        # Fall back to destructive truncation if file write fails
+        logger.warning("Failed to save large tool result to file: %s", exc)
+        return (
+            function_result[:_LARGE_RESULT_CHARS]
+            + f"\n\n[Truncated: tool response was {original_len:,} chars, "
+            f"exceeding the {_LARGE_RESULT_CHARS:,} char limit. "
+            f"File save failed: {exc}]"
+        )
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -467,6 +530,7 @@ class AIAgent:
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
+        parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
@@ -646,6 +710,14 @@ class AIAgent:
         # Detect identical tool batches across consecutive turns (infinite loop guard).
         self._identical_tool_batch_fingerprint: Optional[str] = None
         self._identical_tool_batch_count = 0
+        # Activity tracking — updated on each API call, tool execution, and
+        # stream chunk.  Used by the gateway timeout handler to report what the
+        # agent was doing when it was killed, and by the "still working"
+        # notifications to show progress.
+        self._last_activity_ts: float = time.time()
+        self._last_activity_desc: str = "initializing"
+        self._current_tool: str | None = None
+        self._api_call_count: int = 0
 
         # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
         # so tool failures, API errors, etc. are inspectable after the fact.
@@ -966,6 +1038,7 @@ class AIAgent:
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
+        self._parent_session_id = parent_session_id
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
         if self._session_db:
             try:
@@ -979,6 +1052,7 @@ class AIAgent:
                         "max_tokens": max_tokens,
                     },
                     user_id=None,
+                    parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
                 # Transient SQLite lock contention (e.g. CLI and gateway writing
@@ -1176,6 +1250,9 @@ class AIAgent:
             provider=self.provider,
         )
         self.compression_enabled = compression_enabled
+        self._subdirectory_hints = SubdirectoryHintTracker(
+            working_dir=os.getenv("TERMINAL_CWD") or None,
+        )
         self._user_turn_count = 0
 
         # Cumulative token usage for the session
@@ -1432,6 +1509,25 @@ class AIAgent:
         if not force and self._has_stream_consumers() and not self._executing_tools:
             return
         self._safe_print(*args, **kwargs)
+
+    def _should_start_quiet_spinner(self) -> bool:
+        """Return True when quiet-mode spinner output has a safe sink.
+
+        In headless/stdio-protocol environments, a raw spinner with no custom
+        ``_print_fn`` falls back to ``sys.stdout`` and can corrupt protocol
+        streams such as ACP JSON-RPC. Allow quiet spinners only when either:
+        - output is explicitly rerouted via ``_print_fn``; or
+        - stdout is a real TTY.
+        """
+        if self._print_fn is not None:
+            return True
+        stream = getattr(sys, "stdout", None)
+        if stream is None:
+            return False
+        try:
+            return bool(stream.isatty())
+        except (AttributeError, ValueError, OSError):
+            return False
 
     def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
@@ -2532,6 +2628,29 @@ class AIAgent:
         self._interrupt_requested = False
         self._interrupt_message = None
         _set_interrupt(False)
+
+    def _touch_activity(self, desc: str) -> None:
+        """Update the last-activity timestamp and description (thread-safe)."""
+        self._last_activity_ts = time.time()
+        self._last_activity_desc = desc
+
+    def get_activity_summary(self) -> dict:
+        """Return a snapshot of the agent's current activity for diagnostics.
+
+        Called by the gateway timeout handler to report what the agent was doing
+        when it was killed, and by the periodic "still working" notifications.
+        """
+        elapsed = time.time() - self._last_activity_ts
+        return {
+            "last_activity_ts": self._last_activity_ts,
+            "last_activity_desc": self._last_activity_desc,
+            "seconds_since_activity": round(elapsed, 1),
+            "current_tool": self._current_tool,
+            "api_call_count": self._api_call_count,
+            "max_iterations": self.max_iterations,
+            "budget_used": self.iteration_budget.used,
+            "budget_max": self.iteration_budget.max_total,
+        }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider — call at actual session boundaries.
@@ -4270,6 +4389,7 @@ class AIAgent:
             # Reset stale-stream timer so the detector measures from this
             # attempt's start, not a previous attempt's last chunk.
             last_chunk_time["t"] = time.time()
+            self._touch_activity("waiting for provider response (streaming)")
             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
 
             content_parts: list = []
@@ -4290,8 +4410,12 @@ class AIAgent:
             # knows whether reasoning was already displayed during streaming.
             self._reasoning_deltas_fired = False
 
+            _first_chunk_seen = False
             for chunk in stream:
                 last_chunk_time["t"] = time.time()
+                if not _first_chunk_seen:
+                    _first_chunk_seen = True
+                    self._touch_activity("receiving stream response")
 
                 if self._interrupt_requested:
                     break
@@ -4642,10 +4766,20 @@ class AIAgent:
             # Detect stale streams: connections kept alive by SSE pings
             # but delivering no real chunks.  Kill the client so the
             # inner retry loop can start a fresh connection.
-            if time.time() - last_chunk_time["t"] > _stream_stale_timeout:
+            _stale_elapsed = time.time() - last_chunk_time["t"]
+            if _stale_elapsed > _stream_stale_timeout:
+                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
                 logger.warning(
-                    "Stream stale for %.0fs — no chunks received. Killing connection.",
-                    _stream_stale_timeout,
+                    "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _stream_stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
+                self._emit_status(
+                    f"⚠️ No response from provider for {int(_stale_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}, "
+                    f"context: ~{_est_ctx:,} tokens). "
+                    f"Reconnecting..."
                 )
                 try:
                     rc = request_client_holder.get("client")
@@ -4736,8 +4870,19 @@ class AIAgent:
         # access for Codex providers.
         try:
             from agent.auxiliary_client import resolve_provider_client
+            # Pass base_url and api_key from fallback config so custom
+            # endpoints (e.g. Ollama Cloud) resolve correctly instead of
+            # falling through to OpenRouter defaults.
+            fb_base_url_hint = (fb.get("base_url") or "").strip() or None
+            fb_api_key_hint = (fb.get("api_key") or "").strip() or None
+            # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
+            # when no explicit key is in the fallback config.
+            if fb_base_url_hint and "ollama.com" in fb_base_url_hint.lower() and not fb_api_key_hint:
+                fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
             fb_client, _ = resolve_provider_client(
-                fb_provider, model=fb_model, raw_codex=True)
+                fb_provider, model=fb_model, raw_codex=True,
+                explicit_base_url=fb_base_url_hint,
+                explicit_api_key=fb_api_key_hint)
             if fb_client is None:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
@@ -5994,7 +6139,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
-                    self.tool_progress_callback(name, preview, args)
+                    self.tool_progress_callback("tool.started", name, preview, args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -6023,7 +6168,7 @@ class AIAgent:
 
         # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
-        if self.quiet_mode and not self.tool_progress_callback:
+        if self.quiet_mode and not self.tool_progress_callback and self._should_start_quiet_spinner():
             face = random.choice(KawaiiSpinner.KAWAII_WAITING)
             spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=self._print_fn)
             spinner.start()
@@ -6059,6 +6204,15 @@ class AIAgent:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
+                if self.tool_progress_callback:
+                    try:
+                        self.tool_progress_callback(
+                            "tool.completed", function_name, None, None,
+                            duration=tool_duration, is_error=is_error,
+                        )
+                    except Exception as cb_err:
+                        logging.debug(f"Tool progress callback error: {cb_err}")
+
                 if self.verbose_logging:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
@@ -6075,21 +6229,22 @@ class AIAgent:
                     response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
                     print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
+            self._current_tool = None
+            self._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+
             if self.tool_complete_callback:
                 try:
                     self.tool_complete_callback(tc.id, name, args, function_result)
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            # Truncate oversized results
-            MAX_TOOL_RESULT_CHARS = 100_000
-            if len(function_result) > MAX_TOOL_RESULT_CHARS:
-                original_len = len(function_result)
-                function_result = (
-                    function_result[:MAX_TOOL_RESULT_CHARS]
-                    + f"\n\n[Truncated: tool response was {original_len:,} chars, "
-                    f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
-                )
+            # Save oversized results to file instead of destructive truncation
+            function_result = _save_oversized_tool_result(name, function_result)
+
+            # Discover subdirectory context files from tool arguments
+            subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
+            if subdir_hints:
+                function_result += subdir_hints
 
             # Append tool result message in order
             tool_msg = {
@@ -6162,10 +6317,13 @@ class AIAgent:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
 
+            self._current_tool = function_name
+            self._touch_activity(f"executing tool: {function_name}")
+
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
-                    self.tool_progress_callback(function_name, preview, function_args)
+                    self.tool_progress_callback("tool.started", function_name, preview, function_args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -6258,7 +6416,7 @@ class AIAgent:
                     goal_preview = (function_args.get("goal") or "")[:30]
                     spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
                 spinner = None
-                if self.quiet_mode and not self.tool_progress_callback:
+                if self.quiet_mode and not self.tool_progress_callback and self._should_start_quiet_spinner():
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
@@ -6352,6 +6510,18 @@ class AIAgent:
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
+            if self.tool_progress_callback:
+                try:
+                    self.tool_progress_callback(
+                        "tool.completed", function_name, None, None,
+                        duration=tool_duration, is_error=_is_error_result,
+                    )
+                except Exception as cb_err:
+                    logging.debug(f"Tool progress callback error: {cb_err}")
+
+            self._current_tool = None
+            self._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
+
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
@@ -6362,18 +6532,13 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            # Guard against tools returning absurdly large content that would
-            # blow up the context window. 100K chars ≈ 25K tokens — generous
-            # enough for any reasonable tool output but prevents catastrophic
-            # context explosions (e.g. accidental base64 image dumps).
-            MAX_TOOL_RESULT_CHARS = 100_000
-            if len(function_result) > MAX_TOOL_RESULT_CHARS:
-                original_len = len(function_result)
-                function_result = (
-                    function_result[:MAX_TOOL_RESULT_CHARS]
-                    + f"\n\n[Truncated: tool response was {original_len:,} chars, "
-                    f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
-                )
+            # Save oversized results to file instead of destructive truncation
+            function_result = _save_oversized_tool_result(function_name, function_result)
+
+            # Discover subdirectory context files from tool arguments
+            subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
+            if subdir_hints:
+                function_result += subdir_hints
 
             tool_msg = {
                 "role": "tool",
@@ -6953,6 +7118,8 @@ class AIAgent:
                 break
             
             api_call_count += 1
+            self._api_call_count = api_call_count
+            self._touch_activity(f"starting API call #{api_call_count}")
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
                     self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
@@ -7094,9 +7261,9 @@ class AIAgent:
                     # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                     # (works in both streaming and non-streaming modes)
                     self.thinking_callback(f"{face} {verb}...")
-                elif not self._has_stream_consumers():
-                    # Raw KawaiiSpinner only when no streaming consumers
-                    # (would conflict with streamed token output)
+                elif not self._has_stream_consumers() and self._should_start_quiet_spinner():
+                    # Raw KawaiiSpinner only when no streaming consumers and the
+                    # spinner output has a safe sink.
                     spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
                     thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=self._print_fn)
                     thinking_spinner.start()
@@ -7554,6 +7721,7 @@ class AIAgent:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
                     
                     has_retried_429 = False  # Reset on success
+                    self._touch_activity(f"API call #{api_call_count} completed")
                     break  # Success, exit retry loop
 
                 except InterruptedError:
@@ -7928,7 +8096,7 @@ class AIAgent:
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
-                        self._vprint(f"{self.log_prefix}   🗜️  Context compression attempt {compression_attempts}/{max_compression_attempts}...")
+                        self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                         original_len = len(messages)
                         messages, active_system_prompt = self._compress_context(
@@ -7996,6 +8164,10 @@ class AIAgent:
                         self._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
+                        self._emit_status(
+                            f"❌ Non-retryable error (HTTP {status_code}): "
+                            f"{self._summarize_api_error(api_error)}"
+                        )
                         self._vprint(f"{self.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                         self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                         self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
@@ -8049,9 +8221,9 @@ class AIAgent:
                             continue
                         _final_summary = self._summarize_api_error(api_error)
                         if is_rate_limited:
-                            self._vprint(f"{self.log_prefix}❌ Rate limit persisted after {max_retries} retries. Please try again later.", force=True)
+                            self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
                         else:
-                            self._vprint(f"{self.log_prefix}❌ Max retries ({max_retries}) exceeded. Giving up.", force=True)
+                            self._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
                         self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                         # Detect SSE stream-drop pattern (e.g. "Network
@@ -8218,19 +8390,23 @@ class AIAgent:
 
                 # Notify progress callback of model's thinking (used by subagent
                 # delegation to relay the child's reasoning to the parent display).
-                # Guard: only fire for subagents (_delegate_depth >= 1) to avoid
-                # spamming gateway platforms with the main agent's every thought.
-                if (assistant_message.content and self.tool_progress_callback
-                        and getattr(self, '_delegate_depth', 0) > 0):
+                if (assistant_message.content and self.tool_progress_callback):
                     _think_text = assistant_message.content.strip()
                     # Strip reasoning XML tags that shouldn't leak to parent display
                     _think_text = re.sub(
                         r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                     ).strip()
+                    # For subagents: relay first line to parent display (existing behaviour).
+                    # For all agents with a structured callback: emit reasoning.available event.
                     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
-                    if first_line:
+                    if first_line and getattr(self, '_delegate_depth', 0) > 0:
                         try:
                             self.tool_progress_callback("_thinking", first_line)
+                        except Exception:
+                            pass
+                    elif _think_text:
+                        try:
+                            self.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
                         except Exception:
                             pass
                 
@@ -8630,140 +8806,24 @@ class AIAgent:
                             self._response_was_previewed = True
                             break
 
-                        # No fallback available — classify the empty response before
-                        # blindly spending retries. Some local/custom backends surface
-                        # implicit context pressure as reasoning-only output rather than
-                        # an explicit overflow error.
-                        if not hasattr(self, '_empty_content_retries'):
-                            self._empty_content_retries = 0
-                        self._empty_content_retries += 1
+                        # Reasoning-only response: the model produced thinking
+                        # but no visible content.  This is a valid response —
+                        # keep reasoning in its own field and set content to
+                        # "(empty)" so every provider accepts the message.
+                        # No retries needed.
+                        reasoning_text = self._extract_reasoning(assistant_message)
+                        assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
+                        assistant_msg["content"] = "(empty)"
+                        messages.append(assistant_msg)
 
-                        empty_response_info = self._classify_empty_content_response(
-                            assistant_message,
-                            finish_reason=finish_reason,
-                            approx_tokens=approx_tokens,
-                            api_messages=api_messages,
-                            conversation_history=conversation_history,
-                        )
-                        reasoning_text = empty_response_info["reasoning_text"]
-                        self._vprint(f"{self.log_prefix}⚠️  Response only contains think block with no content after it")
                         if reasoning_text:
                             reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
-                            self._vprint(f"{self.log_prefix}   Reasoning: {reasoning_preview}")
+                            self._vprint(f"{self.log_prefix}ℹ️  Reasoning-only response (no visible content). Reasoning: {reasoning_preview}")
                         else:
-                            content_preview = final_response[:80] + "..." if len(final_response) > 80 else final_response
-                            self._vprint(f"{self.log_prefix}   Content: '{content_preview}'")
+                            self._vprint(f"{self.log_prefix}ℹ️  Empty response (no content or reasoning).")
 
-                        if empty_response_info["should_compress"]:
-                            compression_attempts += 1
-                            if compression_attempts > max_compression_attempts:
-                                self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                                self._vprint(f"{self.log_prefix}   💡 Local/custom backend returned reasoning-only output with no visible content. This often means the resumed/large session exceeds the runtime context window. Try /new or lower model.context_length to the actual runtime limit.", force=True)
-                            else:
-                                self._vprint(f"{self.log_prefix}🗜️  Reasoning-only response looks like implicit context pressure — attempting compression ({compression_attempts}/{max_compression_attempts})...", force=True)
-                                original_len = len(messages)
-                                messages, active_system_prompt = self._compress_context(
-                                    messages, system_message, approx_tokens=approx_tokens,
-                                    task_id=effective_task_id,
-                                )
-                                if len(messages) < original_len:
-                                    conversation_history = None
-                                    self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages after reasoning-only response, retrying...")
-                                    time.sleep(2)
-                                    api_call_count -= 1
-                                    self.iteration_budget.refund()
-                                    retry_count += 1
-                                    continue
-                                self._vprint(f"{self.log_prefix}   Compression could not shrink the session; falling back to retry/salvage logic.")
-
-                        if (
-                            reasoning_text
-                            and empty_response_info["repeated_signature"]
-                            and empty_response_info["has_structured_reasoning"]
-                        ):
-                            self._vprint(f"{self.log_prefix}ℹ️  Structured reasoning-only response repeated unchanged — using reasoning text directly.", force=True)
-                            self._empty_content_retries = 0
-                            final_response = reasoning_text
-                            empty_msg = {
-                                "role": "assistant",
-                                "content": final_response,
-                                "reasoning": reasoning_text,
-                                "finish_reason": finish_reason,
-                            }
-                            messages.append(empty_msg)
-                            break
-                        
-                        if self._empty_content_retries < 3:
-                            self._vprint(f"{self.log_prefix}🔄 Retrying API call ({self._empty_content_retries}/3)...")
-                            continue
-                        else:
-                            self._vprint(f"{self.log_prefix}❌ Max retries (3) for empty content exceeded.", force=True)
-                            self._empty_content_retries = 0
-                            
-                            # If a prior tool_calls turn had real content, salvage it:
-                            # rewrite that turn's content to a brief tool description,
-                            # and use the original content as the final response here.
-                            fallback = getattr(self, '_last_content_with_tools', None)
-                            if fallback:
-                                self._last_content_with_tools = None
-                                # Find the last assistant message with tool_calls and rewrite it
-                                for i in range(len(messages) - 1, -1, -1):
-                                    msg = messages[i]
-                                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                                        tool_names = []
-                                        for tc in msg["tool_calls"]:
-                                            if not tc or not isinstance(tc, dict): continue
-                                            fn = tc.get("function", {})
-                                            tool_names.append(fn.get("name", "unknown"))
-                                        msg["content"] = f"Calling the {', '.join(tool_names)} tool{'s' if len(tool_names) > 1 else ''}..."
-                                        break
-                                # Strip <think> blocks from fallback content for user display
-                                final_response = self._strip_think_blocks(fallback).strip()
-                                self._response_was_previewed = True
-                                break
-                            
-                            # No fallback -- if reasoning_text exists, the model put its
-                            # entire response inside <think> tags; use that as the content.
-                            if reasoning_text:
-                                self._vprint(f"{self.log_prefix}Using reasoning as response content (model wrapped entire response in think tags).", force=True)
-                                final_response = reasoning_text
-                                empty_msg = {
-                                    "role": "assistant",
-                                    "content": final_response,
-                                    "reasoning": reasoning_text,
-                                    "finish_reason": finish_reason,
-                                }
-                                messages.append(empty_msg)
-                                break
-
-                            # Truly empty -- no reasoning and no content
-                            empty_msg = {
-                                "role": "assistant",
-                                "content": final_response,
-                                "reasoning": reasoning_text,
-                                "finish_reason": finish_reason,
-                            }
-                            messages.append(empty_msg)
-
-                            self._cleanup_task_resources(effective_task_id)
-                            self._persist_session(messages, conversation_history)
-
-                            error_message = "Model generated only think blocks with no actual response after 3 retries"
-                            if empty_response_info["is_local_custom"]:
-                                error_message = (
-                                    "Local/custom backend returned reasoning-only output with no visible response after 3 retries. "
-                                    "Likely causes: wrong /v1 endpoint, runtime context window smaller than Hermes expects, "
-                                    "or a resumed/large session exceeding the backend's actual context limit."
-                                )
-
-                            return {
-                                "final_response": final_response or None,
-                                "messages": messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "partial": True,
-                                "error": error_message
-                            }
+                        final_response = "(empty)"
+                        break
                     
                     # Reset retry counter/signature on successful content
                     if hasattr(self, '_empty_content_retries'):
