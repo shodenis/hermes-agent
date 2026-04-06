@@ -601,6 +601,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             else:
                 # ── Polling mode (default) ───────────────────────────
+                # Clear any stale webhook first so polling doesn't inherit a
+                # previous webhook registration and silently stop receiving updates.
+                delete_webhook = getattr(self._bot, "delete_webhook", None)
+                if callable(delete_webhook):
+                    await delete_webhook(drop_pending_updates=False)
+
                 loop = asyncio.get_running_loop()
 
                 def _polling_error_callback(error: Exception) -> None:
@@ -856,6 +862,21 @@ class TelegramAdapter(BasePlatformAdapter):
                             await asyncio.sleep(wait)
                         else:
                             raise
+                    except Exception as send_err:
+                        retry_after = getattr(send_err, "retry_after", None)
+                        if retry_after is not None or "retry after" in str(send_err).lower():
+                            if _send_attempt < 2:
+                                wait = float(retry_after) if retry_after is not None else 1.0
+                                logger.warning(
+                                    "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
+                                    self.name,
+                                    _send_attempt + 1,
+                                    wait,
+                                    send_err,
+                                )
+                                await asyncio.sleep(wait)
+                                continue
+                        raise
                 message_ids.append(str(msg.message_id))
             
             return SendResult(
@@ -1690,6 +1711,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -1748,6 +1770,7 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
