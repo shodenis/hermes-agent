@@ -11,7 +11,9 @@ from ..types import DuplicateResponse, LeadFields, LeadResponse
 logger = logging.getLogger(__name__)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-ISO8601_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+ISO8601_DT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}:\d{2}([+-]\d{2}:\d{2}|Z)?)?$"
+)
 
 
 class BitrixServiceAdapter(ActionProvider):
@@ -81,6 +83,8 @@ class BitrixServiceAdapter(ActionProvider):
 
     def create_contact(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """Create a contact with typed contact fields."""
+        if not hasattr(self._service, "create_contact"):
+            raise NotImplementedError("BitrixService does not implement create_contact")
         try:
             return self._service.create_contact(fields)
         except Exception as e:
@@ -89,6 +93,8 @@ class BitrixServiceAdapter(ActionProvider):
 
     def add_deal_timeline_comment(self, *, deal_id: str, comment: str) -> Dict[str, Any]:
         """Add a comment into deal timeline."""
+        if not hasattr(self._service, "add_deal_timeline_comment"):
+            raise NotImplementedError("BitrixService does not implement add_deal_timeline_comment")
         try:
             return self._service.add_deal_timeline_comment(deal_id=deal_id, comment=comment)
         except Exception as e:
