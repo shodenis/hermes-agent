@@ -46,7 +46,7 @@ class BitrixService(ActionProvider):
         return self.client.call(
             "crm.lead.list",
             {
-                "limit": 1,
+                "limit": 50,
                 "filter[EMAIL]": email,
                 "filter[STATUS_SEMANTIC_ID]": "P",
                 "order[DATE_CREATE]": "DESC",
@@ -62,7 +62,7 @@ class BitrixService(ActionProvider):
                 "filter[CLOSED]": "N",
                 "order[DATE_CREATE]": "DESC",
                 "select[0]": "ID",
-                "limit": 1,
+                "limit": 50,
             },
         )
 
@@ -75,7 +75,7 @@ class BitrixService(ActionProvider):
                 "filter[CLOSED]": "N",
                 "order[DATE_CREATE]": "DESC",
                 "select[0]": "ID",
-                "limit": 1,
+                "limit": 50,
             },
         )
 
