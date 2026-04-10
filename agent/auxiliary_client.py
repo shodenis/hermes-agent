@@ -877,25 +877,37 @@ _AUTO_PROVIDER_LABELS = {
 _AGGREGATOR_PROVIDERS = frozenset({"openrouter", "nous"})
 
 
+def _should_reuse_main_for_auxiliary(main_provider: str, main_model: str) -> bool:
+    """True when auxiliary should use the same client as the main chat model.
+
+    Includes **custom** (e.g. Mimo / OpenAI-compatible base_url) alongside other
+    non-aggregator providers. Only OpenRouter and Nous are excluded from reuse.
+    """
+    p = (main_provider or "").strip().lower()
+    if not p or not (main_model or "").strip():
+        return False
+    if p == "auto":
+        return False
+    return p not in _AGGREGATOR_PROVIDERS
+
+
 def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain.
 
     Priority:
       1. If the user's main provider is NOT an aggregator (OpenRouter / Nous),
-         use their main provider + main model directly.  This ensures users on
-         Alibaba, DeepSeek, ZAI, etc. get auxiliary tasks handled by the same
-         provider they already have credentials for — no OpenRouter key needed.
+         use their main provider + main model directly — including **custom**
+         (OpenAI-compatible endpoint in config.yaml).  Same credentials as
+         the main agent; no OpenRouter required for auxiliary.
       2. OpenRouter → Nous → custom → Codex → API-key providers (original chain).
     """
     global auxiliary_is_nous
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
 
-    # ── Step 1: non-aggregator main provider → use main model directly ──
+    # ── Step 1: non-aggregator main provider (incl. custom / Mimo) → reuse main ──
     main_provider = _read_main_provider()
     main_model = _read_main_model()
-    if (main_provider and main_model
-            and main_provider not in _AGGREGATOR_PROVIDERS
-            and main_provider not in ("auto", "custom", "")):
+    if _should_reuse_main_for_auxiliary(main_provider, main_model):
         client, resolved = resolve_provider_client(main_provider, main_model)
         if client is not None:
             logger.info("Auxiliary auto-detect: using main provider %s (%s)",
@@ -1775,18 +1787,24 @@ def call_llm(
             api_key=resolved_api_key,
         )
         if client is None:
-            # When the user explicitly chose a non-OpenRouter provider but no
-            # credentials were found, fail fast instead of silently routing
-            # through OpenRouter (which causes confusing 404s).
+            # Fail fast for explicit providers (incl. custom) — do not silently
+            # route to OpenRouter when the user chose a direct endpoint.
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in ("auto", "openrouter", "custom"):
+            if _explicit and _explicit not in ("auto", "openrouter"):
+                if _explicit == "custom":
+                    raise RuntimeError(
+                        "Provider 'custom' is set but auxiliary could not resolve "
+                        "OpenAI-compatible credentials (set OPENAI_API_KEY and "
+                        "model.base_url in config, or auxiliary.* base_url). "
+                        "Run: hermes setup"
+                    )
                 raise RuntimeError(
                     f"Provider '{_explicit}' is set in config.yaml but no API key "
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            # For auto/custom, fall back to OpenRouter
-            if not resolved_base_url:
+            # Only auto mode falls back to OpenRouter when unset
+            if _explicit == "auto" and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, falling back to openrouter",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client(
@@ -1934,13 +1952,20 @@ async def async_call_llm(
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in ("auto", "openrouter", "custom"):
+            if _explicit and _explicit not in ("auto", "openrouter"):
+                if _explicit == "custom":
+                    raise RuntimeError(
+                        "Provider 'custom' is set but auxiliary could not resolve "
+                        "OpenAI-compatible credentials (set OPENAI_API_KEY and "
+                        "model.base_url in config, or auxiliary.* base_url). "
+                        "Run: hermes setup"
+                    )
                 raise RuntimeError(
                     f"Provider '{_explicit}' is set in config.yaml but no API key "
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            if not resolved_base_url:
+            if _explicit == "auto" and not resolved_base_url:
                 logger.warning("Provider %s unavailable, falling back to openrouter",
                                resolved_provider)
                 client, final_model = _get_cached_client(

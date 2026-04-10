@@ -346,6 +346,10 @@ class MessageEvent:
     
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Email adapter (optional): used for gateway-built MAX / analytics
+    email_subject: Optional[str] = None
+    email_receive_address: Optional[str] = None  # mailbox that received the message (e.g. zakaz@…)
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -1176,7 +1180,12 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        # and attach a turn-level idempotency key so adapters can suppress
+        # accidental duplicate sends from alternate code paths.
+        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else {}
+        _thread_metadata["delivery_turn_key"] = (
+            f"{session_key}|{event.message_id or ''}|{int(event.timestamp.timestamp())}"
+        )
         typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
         
         try:

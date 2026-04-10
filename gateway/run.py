@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -228,6 +229,12 @@ from gateway.session import (
     build_session_key,
 )
 from gateway.delivery import DeliveryRouter
+from gateway.notifications.max_notify import (
+    dispatch_email_max_gateway,
+    parse_and_strip_hermes_email_max,
+    send_max_text_sync,
+)
+from gateway.email_approval_store import EmailApprovalStore
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 
 
@@ -341,6 +348,14 @@ def _dequeue_pending_text(adapter, session_key: str) -> str | None:
     text = event.text
     if not text and getattr(event, "media_urls", None):
         text = _build_media_placeholder(event)
+    if text:
+        digest = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        logger.info(
+            "PENDING dequeue: session=%s hash=%s len=%d",
+            session_key[:40],
+            digest,
+            len(text),
+        )
     return text
 
 
@@ -486,6 +501,7 @@ class GatewayRunner:
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
         self.delivery_router = DeliveryRouter(self.config)
+        self._email_approval_store = EmailApprovalStore(_hermes_home / "email_approval.db")
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
@@ -735,8 +751,14 @@ class GatewayRunner:
     async def _async_flush_memories(
         self,
         old_session_id: str,
+        session_key: Optional[str] = None,
     ):
-        """Run the sync memory flush in a thread pool so it won't block the event loop."""
+        """Run the sync memory flush in a thread pool so it won't block the event loop.
+
+        ``session_key`` is the gateway session store key (e.g. agent:main:email:...).
+        Call sites pass it for consistency; ``_flush_memories_for_session`` only
+        needs ``old_session_id`` (transcript / Honcho session id).
+        """
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
@@ -1437,6 +1459,11 @@ class GatewayRunner:
         logger.info("Stopping gateway...")
         self._running = False
 
+        try:
+            self._email_approval_store.close()
+        except Exception as e:
+            logger.debug("EmailApprovalStore close failed during shutdown: %s", e)
+
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
@@ -1733,6 +1760,101 @@ class GatewayRunner:
         if config and hasattr(config, "get_unauthorized_dm_behavior"):
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
+
+    @staticmethod
+    def _append_signature_for_preview(text: str) -> str:
+        body = (text or "").strip()
+        if "с уважением" in body.lower():
+            return body
+        raw_sig = os.getenv("EMAIL_SIGNATURE_TEXT", "").strip()
+        if not raw_sig:
+            return body
+        sig = raw_sig.replace("\\n", "\n").strip()
+        if not sig:
+            return body
+        return f"{body}\n\n{sig}" if body else sig
+
+    async def _resolve_max_email_approval(self, event: MessageEvent) -> Optional[str]:
+        if event.source.platform != Platform.MAX:
+            return None
+        raw = (event.text or "").strip()
+        if not raw:
+            return None
+        m = re.search(r"#([A-Fa-f0-9]{8})", raw)
+        if not m:
+            return None
+        pending = self._email_approval_store.get_pending_by_id(m.group(1).upper())
+        if not pending:
+            return None
+
+        normalized = re.sub(r"#([A-Fa-f0-9]{8})", "", raw).strip().lower()
+        if normalized in {"да", "yes"}:
+            return await self._approve_pending_email(pending)
+        if normalized in {"нет", "no"}:
+            self._email_approval_store.mark_status(pending["approval_id"], "rejected")
+            return f"❌ Отправка отменена ({pending['approval_id']})."
+        return await self._correct_pending_email(pending, raw)
+
+    async def _approve_pending_email(self, pending: Dict[str, Any]) -> str:
+        email_adapter = self.adapters.get(Platform.EMAIL)
+        if not email_adapter or not hasattr(email_adapter, "send_approved_draft"):
+            return "✗ Email adapter недоступен для отправки утвержденного черновика."
+        result = await email_adapter.send_approved_draft(
+            to_addr=pending["email_to"],
+            subject=pending.get("email_subject", ""),
+            in_reply_to=pending.get("email_in_reply_to", ""),
+            reply_from_mailbox=pending.get("reply_from_mailbox", ""),
+            draft_text=pending.get("draft_text", ""),
+        )
+        if not result.success:
+            return f"✗ Ошибка отправки: {result.error}"
+        self._email_approval_store.mark_status(pending["approval_id"], "approved")
+        return f"✅ Письмо отправлено ({pending['approval_id']})."
+
+    async def _correct_pending_email(self, pending: Dict[str, Any], correction_text: str) -> str:
+        source = SessionSource(
+            platform=Platform.EMAIL,
+            chat_id=pending["email_to"],
+            chat_type="dm",
+            user_id=pending["email_to"],
+            user_name=pending["email_to"],
+        )
+        session_entry = self.session_store.get_or_create_session(source)
+        context = build_session_context(source, self.config, session_entry)
+        context_prompt = build_session_context_prompt(context, redact_pii=False)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        message = (
+            "[EMAIL_APPROVAL_CORRECTION]\n"
+            "Перепиши клиентский ответ по правке руководителя.\n"
+            "Ответ должен быть кратким, деловым, без внутренних процессов.\n\n"
+            f"Исходящее письмо клиента:\n{pending.get('inbound_text_snapshot') or '(нет)'}\n\n"
+            f"Текущий черновик:\n{pending.get('draft_text') or ''}\n\n"
+            f"Правка руководителя:\n{correction_text}\n"
+        )
+        session_key = self._session_key_for_source(source)
+        result = await self._run_agent(
+            message=message,
+            context_prompt=context_prompt,
+            history=history,
+            source=source,
+            session_id=session_entry.session_id,
+            session_key=session_key,
+        )
+        new_draft = (result.get("final_response") or "").strip()
+        if not new_draft:
+            return "✗ Не удалось сгенерировать исправленный черновик."
+        new_draft = self._append_signature_for_preview(new_draft)
+        self._email_approval_store.update_draft_with_correction(pending["approval_id"], new_draft)
+        subject = pending.get("email_subject") or "Hermes Agent"
+        return (
+            "📬 ЧЕРНОВИК ОТВЕТА\n"
+            f"Кому: {pending['email_to']}\n"
+            f"Тема: {subject}\n"
+            "---\n"
+            f"{new_draft}\n"
+            "---\n"
+            'Отправить? Напиши "да", "нет" или исправление.'
+        )
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -1813,6 +1935,10 @@ class GatewayRunner:
                 _update_prompts.pop(_quick_key, None)
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
                 return f"✓ Sent `{label}` to the update process."
+
+        _approval_response = await self._resolve_max_email_approval(event)
+        if _approval_response is not None:
+            return _approval_response
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -1928,6 +2054,13 @@ class GatewayRunner:
                         message_id=event.message_id,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
+                    _h = hashlib.sha1(queued_text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                    logger.info(
+                        "PENDING enqueue: session=%s reason=command_queue hash=%s len=%d",
+                        _quick_key[:40],
+                        _h,
+                        len(queued_text),
+                    )
                 return "Queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -1960,8 +2093,24 @@ class GatewayRunner:
                                     existing.text = f"{existing.text}\n\n{event.text}".strip()
                         else:
                             adapter._pending_messages[_quick_key] = event
+                            _txt = event.text or _build_media_placeholder(event)
+                            _h = hashlib.sha1(_txt.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                            logger.info(
+                                "PENDING enqueue: session=%s reason=photo_followup_replace hash=%s len=%d",
+                                _quick_key[:40],
+                                _h,
+                                len(_txt),
+                            )
                     else:
                         adapter._pending_messages[_quick_key] = event
+                        _txt = event.text or _build_media_placeholder(event)
+                        _h = hashlib.sha1(_txt.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                        logger.info(
+                            "PENDING enqueue: session=%s reason=photo_followup_new hash=%s len=%d",
+                            _quick_key[:40],
+                            _h,
+                            len(_txt),
+                        )
                 return None
 
             running_agent = self._running_agents.get(_quick_key)
@@ -1978,13 +2127,37 @@ class GatewayRunner:
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     adapter._pending_messages[_quick_key] = event
+                    _txt = event.text or _build_media_placeholder(event)
+                    _h = hashlib.sha1(_txt.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                    logger.info(
+                        "PENDING enqueue: session=%s reason=agent_pending_sentinel hash=%s len=%d",
+                        _quick_key[:40],
+                        _h,
+                        len(_txt),
+                    )
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
             if _quick_key in self._pending_messages:
                 self._pending_messages[_quick_key] += "\n" + event.text
+                _txt = self._pending_messages[_quick_key]
+                _h = hashlib.sha1(_txt.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                logger.info(
+                    "PENDING enqueue: session=%s reason=interrupt_append hash=%s len=%d",
+                    _quick_key[:40],
+                    _h,
+                    len(_txt),
+                )
             else:
                 self._pending_messages[_quick_key] = event.text
+                _txt = self._pending_messages[_quick_key]
+                _h = hashlib.sha1(_txt.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                logger.info(
+                    "PENDING enqueue: session=%s reason=interrupt_new hash=%s len=%d",
+                    _quick_key[:40],
+                    _h,
+                    len(_txt),
+                )
             return None
 
         # Check for commands
@@ -2907,6 +3080,21 @@ class GatewayRunner:
                         "Try again or use /reset to start a fresh session."
                     )
 
+            # Email (bitrix): strip <<<HERMES_EMAIL_MAX>>> from the reply and send MAX from the gateway.
+            if source.platform == Platform.EMAIL:
+                response, _meta_email_max = parse_and_strip_hermes_email_max(response)
+                _sid = agent_result.get("session_id") or session_entry.session_id
+                await dispatch_email_max_gateway(
+                    agent_result,
+                    _meta_email_max,
+                    force_fallback=False,
+                    event=event,
+                    source=source,
+                    stripped_response=response or "",
+                    session_id=_sid,
+                    inbound_text=message_text,
+                )
+
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
@@ -3095,19 +3283,49 @@ class GatewayRunner:
                 # 500 with a large session often means the payload is too large
                 # for the API to process — treat it the same way.
                 if _hist_len > 50:
-                    return (
+                    _ctx_msg = (
                         "⚠️ Session too large for the model's context window.\n"
                         "Use /compact to compress the conversation, or "
                         "/reset to start fresh."
                     )
+                    try:
+                        if source.platform == Platform.EMAIL:
+                            await dispatch_email_max_gateway(
+                                {"failed": True, "completed": False, "final_response": None},
+                                None,
+                                force_fallback=True,
+                                event=event,
+                                source=source,
+                                stripped_response=_ctx_msg,
+                                session_id=session_entry.session_id,
+                                inbound_text=message_text,
+                            )
+                    except Exception:
+                        logger.debug("email MAX notify on context error (non-fatal)", exc_info=True)
+                    return _ctx_msg
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
-            return (
+            err_response = (
                 f"Sorry, I encountered an error ({error_type}).\n"
                 f"{error_detail}\n"
                 f"{status_hint}"
                 "Try again or use /reset to start a fresh session."
             )
+            try:
+                if source.platform == Platform.EMAIL:
+                    await dispatch_email_max_gateway(
+                        {"failed": True, "completed": False, "final_response": None},
+                        None,
+                        force_fallback=True,
+                        event=event,
+                        source=source,
+                        stripped_response=err_response,
+                        session_id=session_entry.session_id,
+                        inbound_text=message_text,
+                    )
+            except Exception:
+                logger.debug("email MAX notify on gateway error (non-fatal)", exc_info=True)
+            return err_response
         finally:
             # Clear session env
             self._clear_session_env()
@@ -6350,6 +6568,8 @@ class GatewayRunner:
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "completed": False,
+                    "failed": True,
                 }
 
             pr = self._provider_routing
@@ -6640,6 +6860,8 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "completed": bool(result.get("completed", False)),
+                    "failed": True,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -6730,6 +6952,8 @@ class GatewayRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "session_id": effective_session_id,
+                "completed": bool(result.get("completed", True)),
+                "failed": bool(result.get("failed", False)),
             }
         
         # Start progress message sender if enabled
@@ -6988,22 +7212,40 @@ class GatewayRunner:
                     adapter = self.adapters.get(source.platform)
                     if adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
+                        _h = hashlib.sha1((pending or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+                        logger.info(
+                            "PENDING enqueue: session=%s reason=interrupt_depth_requeue hash=%s len=%d",
+                            session_key[:40],
+                            _h,
+                            len(pending or ""),
+                        )
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
                 if not was_interrupted:
+                    if source.platform == Platform.EMAIL:
+                        logger.info(
+                            "Skipping pre-send of first_response for email pending follow-up: session=%s",
+                            session_key[:40],
+                        )
+                    else:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
                     # Skip if streaming already delivered it.
-                    _sc = stream_consumer_holder[0]
-                    _already_streamed = _sc and getattr(_sc, "already_sent", False)
-                    first_response = result.get("final_response", "")
-                    if first_response and not _already_streamed:
-                        try:
-                            await adapter.send(source.chat_id, first_response,
-                                               metadata=getattr(event, "metadata", None))
-                        except Exception as e:
-                            logger.warning("Failed to send first response before queued message: %s", e)
+                        _sc = stream_consumer_holder[0]
+                        _already_streamed = _sc and getattr(_sc, "already_sent", False)
+                        first_response = result.get("final_response", "")
+                        if first_response and not _already_streamed:
+                            try:
+                                _event_ts = getattr(event, "timestamp", None)
+                                _turn_epoch = int(_event_ts.timestamp()) if _event_ts is not None else 0
+                                _send_meta = {"delivery_turn_key": f"{session_key}|{getattr(event, 'message_id', '')}|{_turn_epoch}"}
+                                if getattr(source, "thread_id", None):
+                                    _send_meta["thread_id"] = source.thread_id
+                                await adapter.send(source.chat_id, first_response,
+                                                   metadata=_send_meta)
+                            except Exception as e:
+                                logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
@@ -7079,6 +7321,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
+    approval_store = EmailApprovalStore(_hermes_home / "email_approval.db")
 
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
@@ -7110,6 +7353,29 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                     logger.info("Document cache cleanup: removed %d stale file(s)", removed)
             except Exception as e:
                 logger.debug("Document cache cleanup error: %s", e)
+
+        try:
+            expired = approval_store.expire_due()
+            if expired:
+                token = (os.getenv("MAX_BOT_TOKEN") or "").strip()
+                chat_id = (os.getenv("MAX_NOTIFY_CHAT_ID") or os.getenv("MAX_NOTIFY_CHAT") or "").strip()
+                for row in expired:
+                    logger.info(
+                        "[Email][Approval] Expired draft %s for %s (timeout 30m)",
+                        row.get("approval_id"),
+                        row.get("email_to"),
+                    )
+                    if token and chat_id:
+                        msg = (
+                            f"⏱ Черновик {row.get('approval_id')} отменен по таймауту (30 минут).\n"
+                            f"Кому: {row.get('email_to')}"
+                        )
+                        try:
+                            send_max_text_sync(msg, chat_id=chat_id, token=token)
+                        except Exception:
+                            logger.debug("MAX notify on approval timeout failed", exc_info=True)
+        except Exception as e:
+            logger.debug("Email approval expiry sweep error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")
@@ -7245,13 +7511,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     runner = GatewayRunner(config)
     
     # Set up signal handlers
-    def signal_handler():
+    def signal_handler(sig: int):
+        logger.info("Received signal %s, initiating graceful shutdown", sig)
         asyncio.create_task(runner.stop())
     
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, signal_handler)
+            loop.add_signal_handler(sig, signal_handler, sig)
         except NotImplementedError:
             pass
     

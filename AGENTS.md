@@ -362,6 +362,16 @@ in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 
 ---
 
+## Email gateway (inbound)
+
+Adapter: `gateway/platforms/email.py`. Persistent deduplication: `gateway/platforms/email_processed_store.py` (SQLite at `$HERMES_HOME/email_processed.db`). Optional second inbox: `YANDEX_EMAIL_2` / `YANDEX_PASSWORD_2` (see module docstring). Inbound fetch uses `BODY.PEEK[]`; `\\Seen` is applied after a successful dispatch finalize path.
+
+**Duplicate-reply hazard:** If the agent run succeeds but finalize (registry write and/or `STORE \\Seen`) fails, a later poll may treat the message as new and run the agent again. Changes to dispatch or finalize ordering must preserve protection against duplicate client replies (for example a two-phase registry: claim `processing` before the agent, release on agent failure, `dispatched` + `\\Seen` in finalize). Profile `.cursorrules` under `profiles/hermes-agent` state the active design intent for this tradeoff.
+
+**Production split (Kupol):** The legacy **AI Secretary** Celery worker on **95.81.98.30** is **stopped** since **2026-04-06**. **Hermes-bitrix** on **185.250.46.184** is the **only** live processor for **spbkupol@yandex.ru** and **zakaz@spare24.ru**. Do not run both on the same mailboxes (duplicate Bitrix leads). To bring the old worker back: `docker compose -f /root/ai-secretary/docker-compose.yml start worker` only after Hermes is no longer polling those inboxes.
+
+---
+
 ## Profiles: Multi-Instance Support
 
 Hermes supports **profiles** — multiple fully isolated instances, each with its own

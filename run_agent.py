@@ -37,6 +37,8 @@ import tempfile
 import time
 import threading
 import weakref
+import urllib.parse
+import urllib.request
 from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
@@ -71,6 +73,8 @@ from model_tools import (
 from tools.terminal_tool import cleanup_vm
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
+from gateway.integrations.bitrix import BitrixService, BitrixServiceAdapter, CRMUseCases
+from gateway.integrations.max.service import MaxService
 
 
 from hermes_constants import OPENROUTER_BASE_URL
@@ -718,6 +722,16 @@ class AIAgent:
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
+        self._crm: Optional[CRMUseCases] = None
+        bitrix_service = BitrixService.from_env()
+        if bitrix_service is not None:
+            bitrix_user_id = (os.getenv("BITRIX_USER_ID") or "").strip()
+            if not bitrix_user_id:
+                bitrix_user_id = "1"
+                logger.warning("BITRIX_USER_ID is not set; defaulting to %s", bitrix_user_id)
+            adapter = BitrixServiceAdapter(bitrix_service)
+            self._crm = CRMUseCases(actions=adapter, responsible_id=bitrix_user_id)
+        self._max = MaxService.from_env()
 
         # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
         # so tool failures, API errors, etc. are inspectable after the fact.
@@ -6055,10 +6069,175 @@ class AIAgent:
                 parent_agent=self,
             )
         else:
-            return handle_function_call(
+            if function_name == "mcp_bitrix24_crm_bitrix24_create_lead":
+                function_args, blocked_result = self._prepare_bitrix_lead_call(function_args)
+                if blocked_result is not None:
+                    return blocked_result
+            _result = handle_function_call(
                 function_name, function_args, effective_task_id,
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
             )
+            return self._maybe_create_bitrix_lead_activity(function_name, function_args, _result)
+
+    def _bitrix_lead_precheck_by_email(self, sender_email: str) -> Dict[str, str]:
+        out = {
+            "contact_id": "",
+            "company_id": "",
+            "open_lead_id": "",
+            "open_deal_id": "",
+        }
+        if not self._crm or not sender_email:
+            return out
+        try:
+            out.update(self._crm.precheck_by_email(sender_email))
+        except Exception as exc:
+            logger.warning("Bitrix lead precheck failed for %s: %s", sender_email, exc)
+        return out
+
+    def _bitrix_add_lead_comment(self, lead_id: str, *, subject: str, snippet: str) -> bool:
+        if not self._crm or not lead_id:
+            return False
+        ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        comment = (
+            "Follow-up email received.\n"
+            f"Subject: {subject or '(no subject)'}\n"
+            f"Snippet: {(snippet or '')[:500]}\n"
+            f"Timestamp: {ts}"
+        )
+        try:
+            self._crm.log_communication("lead", lead_id, comment)
+            return True
+        except Exception as exc:
+            logger.warning("Bitrix timeline comment failed for lead %s: %s", lead_id, exc)
+            return False
+
+    def _bitrix_send_max_notify(self, text: str) -> None:
+        if not self._max:
+            return
+        try:
+            self._max.send_notify(text)
+        except Exception as exc:
+            logger.warning("MAX notify failed: %s", exc)
+
+    def _prepare_bitrix_lead_call(self, function_args: dict) -> tuple[dict, Optional[str]]:
+        sender_email = str(function_args.get("email") or "").strip().lower()
+        if not sender_email:
+            return function_args, None
+        pre = self._bitrix_lead_precheck_by_email(sender_email)
+        open_lead_id = pre.get("open_lead_id") or ""
+        if open_lead_id:
+            subject = str(function_args.get("title") or "")
+            snippet = str(function_args.get("comments") or "")
+            ok = self._bitrix_add_lead_comment(open_lead_id, subject=subject, snippet=snippet)
+            if ok:
+                self._bitrix_send_max_notify(f"💬 Комментарий добавлен в лид #{open_lead_id}")
+            return function_args, json.dumps(
+                {
+                    "result": {
+                        "success": True,
+                        "leadId": open_lead_id,
+                        "reused": True,
+                        "action": "comment_added",
+                    }
+                },
+                ensure_ascii=False,
+            )
+
+        open_deal_id = pre.get("open_deal_id") or ""
+        if open_deal_id:
+            self._bitrix_send_max_notify(
+                f"📨 Письмо от {sender_email} — есть открытая сделка #{open_deal_id}. Письмо помечено непрочитанным."
+            )
+            return function_args, json.dumps(
+                {
+                    "result": {
+                        "success": True,
+                        "dealId": open_deal_id,
+                        "reused": True,
+                        "action": "open_deal_exists_skip_lead",
+                    }
+                },
+                ensure_ascii=False,
+            )
+
+        patched = dict(function_args)
+        contact_id = pre.get("contact_id") or ""
+        company_id = pre.get("company_id") or ""
+        if contact_id:
+            patched["CONTACT_ID"] = contact_id
+            patched["contactId"] = contact_id
+        if company_id:
+            patched["COMPANY_ID"] = company_id
+            patched["companyId"] = company_id
+        return patched, None
+
+    def _maybe_create_bitrix_lead_activity(self, function_name: str, function_args: dict, function_result: str) -> str:
+        """Create CRM activity right after successful lead creation."""
+        logger.info(
+            "Bitrix lead activity hook entered: function_name=%s args_keys=%s result_preview=%s",
+            function_name,
+            sorted(function_args.keys()) if isinstance(function_args, dict) else [],
+            (function_result[:200] if isinstance(function_result, str) else str(function_result)[:200]),
+        )
+        if function_name != "mcp_bitrix24_crm_bitrix24_create_lead":
+            return function_result
+
+        if not self._crm:
+            logger.warning("Bitrix lead activity skipped: BITRIX24_WEBHOOK_URL is empty")
+            return function_result
+
+        lead_id = ""
+        responsible_id = ""
+        try:
+            parsed = json.loads(function_result or "{}")
+            payload = parsed.get("result") if isinstance(parsed, dict) else None
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            if isinstance(payload, dict):
+                lead_id = str(payload.get("leadId") or "")
+                lead_obj = payload.get("lead") if isinstance(payload.get("lead"), dict) else {}
+                if not lead_id:
+                    lead_id = str(lead_obj.get("ID") or "")
+                responsible_id = str(lead_obj.get("ASSIGNED_BY_ID") or payload.get("assignedById") or "")
+        except Exception:
+            logger.warning("Bitrix lead activity skipped: failed to parse create_lead result")
+            return function_result
+
+        if not lead_id:
+            logger.warning("Bitrix lead activity skipped: lead id not found")
+            return function_result
+
+        sender_email = str(function_args.get("email") or "").strip() or "unknown"
+        activity_subject = f"Обработать запрос: {sender_email}"
+        deadline = datetime.now().astimezone().isoformat(timespec="seconds")
+        resolved_responsible = responsible_id or "1"
+        description = (
+            f"Источник: email\n"
+            f"Отправитель: {sender_email}\n"
+            f"Lead: #{lead_id}"
+        )
+
+        try:
+            resp = self._crm.add_lead_todo(
+                lead_id=lead_id,
+                title=activity_subject,
+                description=description,
+                responsible_id=resolved_responsible,
+                deadline_iso=deadline,
+            )
+            logger.info(
+                "Bitrix lead todo created: lead_id=%s responsible_id=%s response=%s",
+                lead_id,
+                resolved_responsible,
+                (json.dumps(resp, ensure_ascii=False)[:300]),
+            )
+        except Exception as exc:
+            logger.warning("Bitrix lead todo creation failed for lead_id=%s: %s", lead_id, exc)
+
+        return function_result
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
@@ -6474,10 +6653,7 @@ class AIAgent:
                     spinner.start()
                 _spinner_result = None
                 try:
-                    function_result = handle_function_call(
-                        function_name, function_args, effective_task_id,
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                    )
+                    function_result = self._invoke_tool(function_name, function_args, effective_task_id)
                     _spinner_result = function_result
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -6491,10 +6667,7 @@ class AIAgent:
                         self._vprint(f"  {cute_msg}")
             else:
                 try:
-                    function_result = handle_function_call(
-                        function_name, function_args, effective_task_id,
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                    )
+                    function_result = self._invoke_tool(function_name, function_args, effective_task_id)
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
