@@ -37,14 +37,12 @@ _HERMES_CORE_TOOLS = [
     "read_file", "write_file", "patch", "search_files",
     # Vision + image generation
     "vision_analyze", "image_generate",
-    # MoA
-    "mixture_of_agents",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_close", "browser_get_images",
+    "browser_press", "browser_get_images",
     "browser_vision", "browser_console",
     # Text-to-speech
     "text_to_speech",
@@ -116,7 +114,7 @@ TOOLSETS = {
         "tools": [
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_close", "browser_get_images",
+            "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "web_search"
         ],
         "includes": []
@@ -214,7 +212,7 @@ TOOLSETS = {
     
     "safe": {
         "description": "Safe toolkit without terminal access",
-        "tools": ["mixture_of_agents"],
+        "tools": [],
         "includes": ["web", "vision", "image_gen"]
     },
     
@@ -235,7 +233,7 @@ TOOLSETS = {
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_close", "browser_get_images",
+            "browser_press", "browser_get_images",
             "browser_vision", "browser_console",
             "todo", "memory",
             "session_search",
@@ -255,14 +253,12 @@ TOOLSETS = {
             "read_file", "write_file", "patch", "search_files",
             # Vision + image generation
             "vision_analyze", "image_generate",
-            # MoA
-            "mixture_of_agents",
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_close", "browser_get_images",
+            "browser_press", "browser_get_images",
             "browser_vision", "browser_console",
             # Planning & memory
             "todo", "memory",
@@ -315,6 +311,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-bluebubbles": {
+        "description": "BlueBubbles iMessage bot toolset - Apple iMessage via local BlueBubbles server",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-homeassistant": {
         "description": "Home Assistant bot toolset - smart home event monitoring and control",
         "tools": _HERMES_CORE_TOOLS,
@@ -357,8 +359,26 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-weixin": {
+        "description": "Weixin bot toolset - personal WeChat messaging via iLink (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-qqbot": {
+        "description": "QQBot toolset - QQ messaging via Official Bot API v2 (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-wecom": {
         "description": "WeCom bot toolset - enterprise WeChat messaging (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-wecom-callback": {
+        "description": "WeCom callback toolset - enterprise self-built app messaging (full access)",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
@@ -378,7 +398,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-max", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-webhook"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook"]
     }
 }
 
@@ -441,7 +461,7 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
         if name in _get_plugin_toolset_names():
             try:
                 from tools.registry import registry
-                return [e.name for e in registry._tools.values() if e.toolset == name]
+                return registry.get_tool_names_for_toolset(name)
             except Exception:
                 pass
         return []
@@ -487,9 +507,9 @@ def _get_plugin_toolset_names() -> Set[str]:
     try:
         from tools.registry import registry
         return {
-            entry.toolset
-            for entry in registry._tools.values()
-            if entry.toolset not in TOOLSETS
+            toolset_name
+            for toolset_name in registry.get_registered_toolset_names()
+            if toolset_name not in TOOLSETS
         }
     except Exception:
         return set()
@@ -510,7 +530,7 @@ def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
         if ts_name not in result:
             try:
                 from tools.registry import registry
-                tools = [e.name for e in registry._tools.values() if e.toolset == ts_name]
+                tools = registry.get_tool_names_for_toolset(ts_name)
                 result[ts_name] = {
                     "description": f"Plugin toolset: {ts_name}",
                     "tools": tools,
@@ -602,7 +622,7 @@ def get_toolset_info(name: str) -> Dict[str, Any]:
         "includes": toolset["includes"],
         "resolved_tools": resolved_tools,
         "tool_count": len(resolved_tools),
-        "is_composite": len(toolset["includes"]) > 0
+        "is_composite": bool(toolset["includes"])
     }
 
 

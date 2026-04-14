@@ -70,6 +70,7 @@ Thread safety:
 """
 
 import asyncio
+import concurrent.futures
 import inspect
 import json
 import logging
@@ -82,6 +83,24 @@ import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_DEBUG_LOG_PATH = "/root/.hermes/.cursor/debug-e13273.log"
+
+
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        payload = {
+            "sessionId": "e13273",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Graceful import -- MCP SDK is an optional dependency
@@ -162,6 +181,7 @@ if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
 _DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
+_MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
 
 # Environment variables that are safe to pass to stdio subprocesses
@@ -792,7 +812,7 @@ class MCPServerTask:
         After the initial ``await`` (list_tools), all mutations are synchronous
         — atomic from the event loop's perspective.
         """
-        from tools.registry import registry
+        from tools.registry import registry, tool_error
         from toolsets import TOOLSETS
 
         async with self._refresh_lock:
@@ -833,6 +853,15 @@ class MCPServerTask:
 
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
+        # region agent log
+        _debug_log(
+            run_id="pre-fix",
+            hypothesis_id="M3",
+            location="tools/mcp_tool.py:MCPServerTask._run_stdio",
+            message="stdio spawn params prepared",
+            data={"server_name": self.name, "command": command, "args": args[:6]},
+        )
+        # endregion
 
         # Check package against OSV malware database before spawning
         from tools.osv_check import check_package_for_malware
@@ -865,6 +894,15 @@ class MCPServerTask:
                 self.session = session
                 await self._discover_tools()
                 self._ready.set()
+                # region agent log
+                _debug_log(
+                    run_id="pre-fix",
+                    hypothesis_id="M4",
+                    location="tools/mcp_tool.py:MCPServerTask._run_stdio",
+                    message="stdio session initialized",
+                    data={"server_name": self.name, "tools_count": len(self._tools)},
+                )
+                # endregion
                 await self._shutdown_event.wait()
         # Context exited cleanly — subprocess was terminated by the SDK.
         if new_pids:
@@ -892,7 +930,9 @@ class MCPServerTask:
         if self._auth_type == "oauth":
             try:
                 from tools.mcp_oauth import build_oauth_auth
-                _oauth_auth = build_oauth_auth(self.name, url)
+                _oauth_auth = build_oauth_auth(
+                    self.name, url, config.get("oauth")
+                )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
                 raise
@@ -982,6 +1022,7 @@ class MCPServerTask:
                 self.name,
             )
         retries = 0
+        initial_retries = 0
         backoff = 1.0
 
         while True:
@@ -995,11 +1036,37 @@ class MCPServerTask:
             except Exception as exc:
                 self.session = None
 
-                # If this is the first connection attempt, report the error
+                # If this is the first connection attempt, retry with backoff
+                # before giving up. A transient DNS/network blip at startup
+                # should not permanently kill the server.
+                # (Ported from Kilo Code's MCP resilience fix.)
                 if not self._ready.is_set():
-                    self._error = exc
-                    self._ready.set()
-                    return
+                    initial_retries += 1
+                    if initial_retries > _MAX_INITIAL_CONNECT_RETRIES:
+                        logger.warning(
+                            "MCP server '%s' failed initial connection after "
+                            "%d attempts, giving up: %s",
+                            self.name, _MAX_INITIAL_CONNECT_RETRIES, exc,
+                        )
+                        self._error = exc
+                        self._ready.set()
+                        return
+
+                    logger.warning(
+                        "MCP server '%s' initial connection failed "
+                        "(attempt %d/%d), retrying in %.0fs: %s",
+                        self.name, initial_retries,
+                        _MAX_INITIAL_CONNECT_RETRIES, backoff, exc,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+
+                    # Check if shutdown was requested during the sleep
+                    if self._shutdown_event.is_set():
+                        self._error = exc
+                        self._ready.set()
+                        return
+                    continue
 
                 # If shutdown was requested, don't reconnect
                 if self._shutdown_event.is_set():
@@ -1137,13 +1204,43 @@ def _ensure_mcp_loop():
 
 
 def _run_on_mcp_loop(coro, timeout: float = 30):
-    """Schedule a coroutine on the MCP event loop and block until done."""
+    """Schedule a coroutine on the MCP event loop and block until done.
+
+    Poll in short intervals so the calling agent thread can honor user
+    interrupts while the MCP work is still running on the background loop.
+    """
+    from tools.interrupt import is_interrupted
+
     with _lock:
         loop = _mcp_loop
     if loop is None or not loop.is_running():
         raise RuntimeError("MCP event loop is not running")
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=timeout)
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    while True:
+        if is_interrupted():
+            future.cancel()
+            raise InterruptedError("User sent a new message")
+
+        wait_timeout = 0.1
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return future.result(timeout=0)
+            wait_timeout = min(wait_timeout, remaining)
+
+        try:
+            return future.result(timeout=wait_timeout)
+        except concurrent.futures.TimeoutError:
+            continue
+
+
+def _interrupted_call_result() -> str:
+    """Standardized JSON error for a user-interrupted MCP tool call."""
+    return json.dumps({
+        "error": "MCP call interrupted: user sent a new message"
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1180,6 +1277,15 @@ def _load_mcp_config() -> Dict[str, dict]:
         config = load_config()
         servers = config.get("mcp_servers")
         if not servers or not isinstance(servers, dict):
+            # region agent log
+            _debug_log(
+                run_id="pre-fix",
+                hypothesis_id="M1",
+                location="tools/mcp_tool.py:_load_mcp_config",
+                message="no mcp_servers in config",
+                data={"has_servers": bool(servers)},
+            )
+            # endregion
             return {}
         # Ensure .env vars are available for interpolation
         try:
@@ -1187,7 +1293,17 @@ def _load_mcp_config() -> Dict[str, dict]:
             load_hermes_dotenv()
         except Exception:
             pass
-        return {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        resolved = {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        # region agent log
+        _debug_log(
+            run_id="pre-fix",
+            hypothesis_id="M1",
+            location="tools/mcp_tool.py:_load_mcp_config",
+            message="mcp config loaded",
+            data={"server_names": list(resolved.keys())},
+        )
+        # endregion
+        return resolved
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -1208,8 +1324,26 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         ImportError: if HTTP transport is needed but not available.
         Exception: on connection or initialization failure.
     """
+    # region agent log
+    _debug_log(
+        run_id="pre-fix",
+        hypothesis_id="M2",
+        location="tools/mcp_tool.py:_connect_server",
+        message="connect server start",
+        data={"server_name": name, "transport": "http" if "url" in config else "stdio"},
+    )
+    # endregion
     server = MCPServerTask(name)
     await server.start(config)
+    # region agent log
+    _debug_log(
+        run_id="pre-fix",
+        hypothesis_id="M2",
+        location="tools/mcp_tool.py:_connect_server",
+        message="connect server success",
+        data={"server_name": name},
+    )
+    # endregion
     return server
 
 
@@ -1251,11 +1385,36 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             for block in (result.content or []):
                 if hasattr(block, "text"):
                     parts.append(block.text)
-            return json.dumps({"result": "\n".join(parts) if parts else ""})
+            text_result = "\n".join(parts) if parts else ""
+
+            # Combine content + structuredContent when both are present.
+            # MCP spec: content is model-oriented (text), structuredContent
+            # is machine-oriented (JSON metadata).  For an AI agent, content
+            # is the primary payload; structuredContent supplements it.
+            structured = getattr(result, "structuredContent", None)
+            if structured is not None:
+                if text_result:
+                    return json.dumps({
+                        "result": text_result,
+                        "structuredContent": structured,
+                    })
+                return json.dumps({"result": structured})
+            return json.dumps({"result": text_result})
 
         try:
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+        except InterruptedError:
+            return _interrupted_call_result()
         except Exception as exc:
+            # region agent log
+            _debug_log(
+                run_id="pre-fix",
+                hypothesis_id="M5",
+                location="tools/mcp_tool.py:_make_tool_handler",
+                message="mcp tool call failed",
+                data={"server_name": server_name, "tool_name": tool_name, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            # endregion
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
@@ -1298,6 +1457,8 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
 
         try:
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+        except InterruptedError:
+            return _interrupted_call_result()
         except Exception as exc:
             logger.error(
                 "MCP %s/list_resources failed: %s", server_name, exc,
@@ -1315,6 +1476,8 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.registry import tool_error
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1324,7 +1487,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         uri = args.get("uri")
         if not uri:
-            return json.dumps({"error": "Missing required parameter 'uri'"})
+            return tool_error("Missing required parameter 'uri'")
 
         async def _call():
             result = await server.session.read_resource(uri)
@@ -1340,6 +1503,8 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         try:
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+        except InterruptedError:
+            return _interrupted_call_result()
         except Exception as exc:
             logger.error(
                 "MCP %s/read_resource failed: %s", server_name, exc,
@@ -1387,6 +1552,8 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
 
         try:
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+        except InterruptedError:
+            return _interrupted_call_result()
         except Exception as exc:
             logger.error(
                 "MCP %s/list_prompts failed: %s", server_name, exc,
@@ -1404,6 +1571,8 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.registry import tool_error
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1413,7 +1582,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         name = args.get("name")
         if not name:
-            return json.dumps({"error": "Missing required parameter 'name'"})
+            return tool_error("Missing required parameter 'name'")
         arguments = args.get("arguments", {})
 
         async def _call():
@@ -1440,6 +1609,8 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         try:
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+        except InterruptedError:
+            return _interrupted_call_result()
         except Exception as exc:
             logger.error(
                 "MCP %s/get_prompt failed: %s", server_name, exc,
@@ -1722,7 +1893,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     Returns:
         List of registered prefixed tool names.
     """
-    from tools.registry import registry
+    from tools.registry import registry, tool_error
     from toolsets import create_custom_toolset, TOOLSETS
 
     registered_names: List[str] = []
@@ -1883,6 +2054,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             for k, v in servers.items()
             if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
         }
+    # region agent log
+    _debug_log(
+        run_id="pre-fix",
+        hypothesis_id="M2",
+        location="tools/mcp_tool.py:register_mcp_servers",
+        message="register_mcp_servers evaluated candidates",
+        data={"all_servers": list(servers.keys()), "new_servers": list(new_servers.keys())},
+    )
+    # endregion
 
     if not new_servers:
         _sync_mcp_toolsets(list(servers.keys()))
@@ -1905,6 +2085,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         for name, result in zip(server_names, results):
             if isinstance(result, Exception):
                 command = new_servers.get(name, {}).get("command")
+                # region agent log
+                _debug_log(
+                    run_id="pre-fix",
+                    hypothesis_id="M2",
+                    location="tools/mcp_tool.py:register_mcp_servers",
+                    message="server connect failed",
+                    data={"server_name": name, "command": command or "", "error": _format_connect_error(result)},
+                )
+                # endregion
                 logger.warning(
                     "Failed to connect to MCP server '%s'%s: %s",
                     name,
@@ -2140,6 +2329,7 @@ def _kill_orphaned_mcp_children() -> None:
     Only kills PIDs tracked in ``_stdio_pids`` — never arbitrary children.
     """
     import signal as _signal
+    kill_signal = getattr(_signal, "SIGKILL", _signal.SIGTERM)
 
     with _lock:
         pids = list(_stdio_pids)
@@ -2147,7 +2337,7 @@ def _kill_orphaned_mcp_children() -> None:
 
     for pid in pids:
         try:
-            os.kill(pid, _signal.SIGKILL)
+            os.kill(pid, kill_signal)
             logger.debug("Force-killed orphaned MCP stdio process %d", pid)
         except (ProcessLookupError, PermissionError, OSError):
             pass  # Already exited or inaccessible

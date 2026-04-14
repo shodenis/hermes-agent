@@ -12,7 +12,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
 from agent.skill_utils import (
@@ -40,7 +40,7 @@ _CONTEXT_THREAT_PATTERNS = [
     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
     (r'act\s+as\s+(if|though)\s+you\s+(have\s+no|don\'t\s+have)\s+(restrictions|limits|rules)', "bypass_restrictions"),
     (r'<!--[^>]*(?:ignore|override|system|secret|hidden)[^>]*-->', "html_comment_injection"),
-    (r'<\s*div\s+style\s*=\s*["\'].*display\s*:\s*none', "hidden_div"),
+    (r'<\s*div\s+style\s*=\s*["\'][\s\S]*?display\s*:\s*none', "hidden_div"),
     (r'translate\s+.*\s+into\s+.*\s+and\s+(execute|run|eval)', "translate_execute"),
     (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl"),
     (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass)', "read_secrets"),
@@ -187,7 +187,71 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
-TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma")
+TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")
+
+# OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
+# where GPT models abandon work on partial results, skip prerequisite lookups,
+# hallucinate instead of using tools, and declare "done" without verification.
+# Inspired by patterns from OpenAI's GPT-5.4 prompting guide & OpenClaw PR #38953.
+OPENAI_MODEL_EXECUTION_GUIDANCE = (
+    "# Execution discipline\n"
+    "<tool_persistence>\n"
+    "- Use tools whenever they improve correctness, completeness, or grounding.\n"
+    "- Do not stop early when another tool call would materially improve the result.\n"
+    "- If a tool returns empty or partial results, retry with a different query or "
+    "strategy before giving up.\n"
+    "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
+    "the result.\n"
+    "</tool_persistence>\n"
+    "\n"
+    "<mandatory_tool_use>\n"
+    "NEVER answer these from memory or mental computation — ALWAYS use a tool:\n"
+    "- Arithmetic, math, calculations → use terminal or execute_code\n"
+    "- Hashes, encodings, checksums → use terminal (e.g. sha256sum, base64)\n"
+    "- Current time, date, timezone → use terminal (e.g. date)\n"
+    "- System state: OS, CPU, memory, disk, ports, processes → use terminal\n"
+    "- File contents, sizes, line counts → use read_file, search_files, or terminal\n"
+    "- Git history, branches, diffs → use terminal\n"
+    "- Current facts (weather, news, versions) → use web_search\n"
+    "Your memory and user profile describe the USER, not the system you are "
+    "running on. The execution environment may differ from what the user profile "
+    "says about their personal setup.\n"
+    "</mandatory_tool_use>\n"
+    "\n"
+    "<act_dont_ask>\n"
+    "When a question has an obvious default interpretation, act on it immediately "
+    "instead of asking for clarification. Examples:\n"
+    "- 'Is port 443 open?' → check THIS machine (don't ask 'open where?')\n"
+    "- 'What OS am I running?' → check the live system (don't use user profile)\n"
+    "- 'What time is it?' → run `date` (don't guess)\n"
+    "Only ask for clarification when the ambiguity genuinely changes what tool "
+    "you would call.\n"
+    "</act_dont_ask>\n"
+    "\n"
+    "<prerequisite_checks>\n"
+    "- Before taking an action, check whether prerequisite discovery, lookup, or "
+    "context-gathering steps are needed.\n"
+    "- Do not skip prerequisite steps just because the final action seems obvious.\n"
+    "- If a task depends on output from a prior step, resolve that dependency first.\n"
+    "</prerequisite_checks>\n"
+    "\n"
+    "<verification>\n"
+    "Before finalizing your response:\n"
+    "- Correctness: does the output satisfy every stated requirement?\n"
+    "- Grounding: are factual claims backed by tool outputs or provided context?\n"
+    "- Formatting: does the output match the requested format or schema?\n"
+    "- Safety: if the next step has side effects (file writes, commands, API calls), "
+    "confirm scope before executing.\n"
+    "</verification>\n"
+    "\n"
+    "<missing_context>\n"
+    "- If required context is missing, do NOT guess or hallucinate an answer.\n"
+    "- Use the appropriate lookup tool when missing information is retrievable "
+    "(search_files, web_search, read_file, etc.).\n"
+    "- Ask a clarifying question only when the information cannot be retrieved by tools.\n"
+    "- If you must proceed with incomplete information, label assumptions explicitly.\n"
+    "</missing_context>"
+)
 
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.
@@ -294,7 +358,70 @@ PLATFORM_HINTS = {
         "with target='max:CHAT_ID' or target='max' for the home channel. "
         "Your home channel is Spare24 (chat_id: -72597598792341)."
     ),
+    "bluebubbles": (
+        "You are chatting via iMessage (BlueBubbles). iMessage does not render "
+        "markdown formatting — use plain text. Keep responses concise as they "
+        "appear as text messages. You can send media files natively: include "
+        "MEDIA:/absolute/path/to/file in your response. Images (.jpg, .png, "
+        ".heic) appear as photos and other files arrive as attachments."
+    ),
+    "weixin": (
+        "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "
+        "it improves readability, but keep the message compact and chat-friendly. You can send media files natively: "
+        "include MEDIA:/absolute/path/to/file in your response. Images are sent as native "
+        "photos, videos play inline when supported, and other files arrive as downloadable "
+        "documents. You can also include image URLs in markdown format ![alt](url) and they "
+        "will be downloaded and sent as native media when possible."
+    ),
+    "wecom": (
+        "You are on WeCom (企业微信 / Enterprise WeChat). Markdown formatting is supported. "
+        "You CAN send media files natively — to deliver a file to the user, include "
+        "MEDIA:/absolute/path/to/file in your response. The file will be sent as a native "
+        "WeCom attachment: images (.jpg, .png, .webp) are sent as photos (up to 10 MB), "
+        "other files (.pdf, .docx, .xlsx, .md, .txt, etc.) arrive as downloadable documents "
+        "(up to 20 MB), and videos (.mp4) play inline. Voice messages are supported but "
+        "must be in AMR format — other audio formats are automatically sent as file attachments. "
+        "You can also include image URLs in markdown format ![alt](url) and they will be "
+        "downloaded and sent as native photos. Do NOT tell the user you lack file-sending "
+        "capability — use MEDIA: syntax whenever a file delivery is appropriate."
+    ),
+    "qqbot": (
+        "You are on QQ, a popular Chinese messaging platform. QQ supports markdown formatting "
+        "and emoji. You can send media files natively: include MEDIA:/absolute/path/to/file in "
+        "your response. Images are sent as native photos, and other files arrive as downloadable "
+        "documents."
+    ),
 }
+
+# ---------------------------------------------------------------------------
+# Environment hints — execution-environment awareness for the agent.
+# Unlike PLATFORM_HINTS (which describe the messaging channel), these describe
+# the machine/OS the agent's tools actually run on.
+# ---------------------------------------------------------------------------
+
+WSL_ENVIRONMENT_HINT = (
+    "You are running inside WSL (Windows Subsystem for Linux). "
+    "The Windows host filesystem is mounted under /mnt/ — "
+    "/mnt/c/ is the C: drive, /mnt/d/ is D:, etc. "
+    "The user's Windows files are typically at "
+    "/mnt/c/Users/<username>/Desktop/, Documents/, Downloads/, etc. "
+    "When the user references Windows paths or desktop files, translate "
+    "to the /mnt/c/ equivalent. You can list /mnt/c/Users/ to discover "
+    "the Windows username if needed."
+)
+
+
+def build_environment_hints() -> str:
+    """Return environment-specific guidance for the system prompt.
+
+    Detects WSL, and can be extended for Termux, Docker, etc.
+    Returns an empty string when no special environment is detected.
+    """
+    hints: list[str] = []
+    if is_wsl():
+        hints.append(WSL_ENVIRONMENT_HINT)
+    return "\n\n".join(hints)
+
 
 CONTEXT_FILE_MAX_CHARS = 20_000
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
@@ -417,7 +544,7 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     (True, {}, "") to err on the side of showing the skill.
     """
     try:
-        raw = skill_file.read_text(encoding="utf-8")[:2000]
+        raw = skill_file.read_text(encoding="utf-8")
         frontmatter, _ = parse_frontmatter(raw)
 
         if not skill_matches_platform(frontmatter):
@@ -425,19 +552,8 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
 
         return True, frontmatter, extract_skill_description(frontmatter)
     except Exception as e:
-        logger.debug("Failed to parse skill file %s: %s", skill_file, e)
+        logger.warning("Failed to parse skill file %s: %s", skill_file, e)
         return True, {}, ""
-
-
-def _read_skill_conditions(skill_file: Path) -> dict:
-    """Extract conditional activation fields from SKILL.md frontmatter."""
-    try:
-        raw = skill_file.read_text(encoding="utf-8")[:2000]
-        frontmatter, _ = parse_frontmatter(raw)
-        return extract_skill_conditions(frontmatter)
-    except Exception as e:
-        logger.debug("Failed to read skill conditions from %s: %s", skill_file, e)
-        return {}
 
 
 def _skill_should_show(
@@ -489,8 +605,7 @@ def build_skills_system_prompt(
     are read-only — they appear in the index but new skills are always created
     in the local dir.  Local skills take precedence when names collide.
     """
-    hermes_home = get_hermes_home()
-    skills_dir = hermes_home / "skills"
+    skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
 
     if not skills_dir.exists() and not external_dirs:
@@ -499,9 +614,10 @@ def build_skills_system_prompt(
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
+    from gateway.session_context import get_session_env
     _platform_hint = (
         os.environ.get("HERMES_PLATFORM")
-        or os.environ.get("HERMES_SESSION_PLATFORM")
+        or get_session_env("HERMES_SESSION_PLATFORM")
         or ""
     )
     cache_key = (
@@ -667,8 +783,16 @@ def build_skills_system_prompt(
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If one clearly matches your task, "
-            "load it with skill_view(name) and follow its instructions. "
+            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+            "Err on the side of loading — it is always better to have context you don't need "
+            "than to miss critical steps, pitfalls, or established workflows. "
+            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+            "and proven workflows that outperform general-purpose approaches. Load the skill "
+            "even if you think you could handle the task with basic tools like web_search or terminal. "
+            "Skills also encode the user's preferred approach, conventions, and quality standards "
+            "for tasks like code review, planning, and testing — load them even for tasks you "
+            "already know how to do, because the skill defines how it should be done here.\n"
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "
@@ -678,7 +802,7 @@ def build_skills_system_prompt(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "If none match, proceed normally without loading a skill."
+            "Only proceed without loading a skill if genuinely none are relevant to the task."
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
@@ -713,7 +837,6 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
         "browser_type",
         "browser_scroll",
         "browser_console",
-        "browser_close",
         "browser_press",
         "browser_get_images",
         "browser_vision",
@@ -743,13 +866,13 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 
     lines = [
         "# Nous Subscription",
-        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, and browser automation (Browserbase) by default. Modal execution is optional.",
+        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, and browser automation (Browser Use) by default. Modal execution is optional.",
         "Current capability status:",
     ]
     lines.extend(_status_line(feature) for feature in features.items())
     lines.extend(
         [
-            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, or Browserbase API keys.",
+            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, or Browser-Use API keys.",
             "If the user is not subscribed and asks for a capability that Nous subscription would unlock or simplify, suggest Nous subscription as one option alongside direct setup or local alternatives.",
             "Do not mention subscription unless the user asks about it or it directly solves the current missing capability.",
             "Useful commands: hermes setup, hermes setup tools, hermes setup terminal, hermes status.",
