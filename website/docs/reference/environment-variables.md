@@ -226,6 +226,11 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `SLACK_ALLOWED_USERS` | Comma-separated Slack user IDs |
 | `SLACK_HOME_CHANNEL` | Default Slack channel for cron delivery |
 | `SLACK_HOME_CHANNEL_NAME` | Display name for the Slack home channel |
+| `MAX_BOT_TOKEN` | MAX bot token from `@MasterBot` |
+| `MAX_ALLOWED_USERS` | Comma-separated MAX user IDs allowed to message the bot |
+| `MAX_ALLOW_ALL_USERS` | Allow all MAX users without an allowlist (`true`/`false`) |
+| `MAX_HOME_CHANNEL` | MAX chat ID for cron delivery and notifications |
+| `MAX_HOME_CHANNEL_NAME` | Display name for the MAX home channel |
 | `WHATSAPP_ENABLED` | Enable the WhatsApp bridge (`true`/`false`) |
 | `WHATSAPP_MODE` | `bot` (separate number) or `self-chat` (message yourself) |
 | `WHATSAPP_ALLOWED_USERS` | Comma-separated phone numbers (with country code, no `+`), or `*` to allow all senders |

@@ -63,6 +63,7 @@ class Platform(Enum):
     WEBHOOK = "webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
+    MAX = "max"
     WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
@@ -808,6 +809,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.TELEGRAM: "TELEGRAM_BOT_TOKEN",
         Platform.DISCORD: "DISCORD_BOT_TOKEN",
         Platform.SLACK: "SLACK_BOT_TOKEN",
+        Platform.MAX: "MAX_BOT_TOKEN",
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
@@ -927,6 +929,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform=Platform.SLACK,
             chat_id=slack_home,
             name=os.getenv("SLACK_HOME_CHANNEL_NAME", ""),
+        )
+
+    # MAX
+    max_token = os.getenv("MAX_BOT_TOKEN")
+    if max_token:
+        if Platform.MAX not in config.platforms:
+            config.platforms[Platform.MAX] = PlatformConfig()
+        config.platforms[Platform.MAX].enabled = True
+        config.platforms[Platform.MAX].token = max_token
+
+    max_home = os.getenv("MAX_HOME_CHANNEL")
+    if max_home and Platform.MAX in config.platforms:
+        config.platforms[Platform.MAX].home_channel = HomeChannel(
+            platform=Platform.MAX,
+            chat_id=max_home,
+            name=os.getenv("MAX_HOME_CHANNEL_NAME", "Home"),
         )
     
     # Signal

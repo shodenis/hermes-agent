@@ -289,6 +289,6 @@ def format_directory_for_display() -> str:
             lines.append("")
 
     lines.append('Use these as the "target" parameter when sending.')
-    lines.append('Bare platform name (e.g. "telegram") sends to home channel.')
+    lines.append('Bare platform name (e.g. "telegram" or "max") sends to home channel.')
 
     return "\n".join(lines)

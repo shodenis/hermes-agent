@@ -143,6 +143,7 @@ PLATFORMS = {
     k: {"label": info.label, "default_toolset": info.default_toolset}
     for k, info in _PLATFORMS_REGISTRY.items()
 }
+PLATFORMS.setdefault("max", {"label": "💬 MAX", "default_toolset": "hermes-max"})
 
 
 # ─── Tool Categories (provider-aware configuration) ──────────────────────────
@@ -581,6 +582,8 @@ def _get_enabled_platforms() -> List[str]:
         enabled.append("whatsapp")
     if get_env_value("QQ_APP_ID"):
         enabled.append("qqbot")
+    if get_env_value("MAX_BOT_TOKEN"):
+        enabled.append("max")
     return enabled
 
 

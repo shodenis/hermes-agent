@@ -392,6 +392,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-max": {
+        "description": "MAX bot toolset - max.ru / VK Teams messaging (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-dingtalk": {
         "description": "DingTalk bot toolset - enterprise messaging platform (full access)",
         "tools": _HERMES_CORE_TOOLS,
@@ -449,7 +455,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-max", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook"]
     }
 }
 

@@ -36,7 +36,7 @@ hermes-agent/
 ├── gateway/              # Messaging gateway — run.py + session.py + platforms/
 │   ├── platforms/        # Adapter per platform (telegram, discord, slack, whatsapp,
 │   │                     #   homeassistant, signal, matrix, mattermost, email, sms,
-│   │                     #   dingtalk, wecom, weixin, feishu, qqbot, bluebubbles,
+│   │                     #   max, dingtalk, wecom, weixin, feishu, qqbot, bluebubbles,
 │   │                     #   webhook, api_server, ...). See ADDING_A_PLATFORM.md.
 │   └── builtin_hooks/    # Always-registered gateway hooks (boot-md, ...)
 ├── plugins/              # Plugin system (see "Plugins" section below)

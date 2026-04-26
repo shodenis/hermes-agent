@@ -1,12 +1,12 @@
 ---
 sidebar_position: 1
 title: "Messaging Gateway"
-description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Webhooks, or any OpenAI-compatible frontend via the API server — architecture and setup overview"
+description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, MAX, DingTalk, Webhooks, or any OpenAI-compatible frontend via the API server — architecture and setup overview"
 ---
 
 # Messaging Gateway
 
-Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Feishu/Lark, WeCom, Weixin, BlueBubbles (iMessage), QQ, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
+Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, MAX, DingTalk, Feishu/Lark, WeCom, Weixin, BlueBubbles (iMessage), QQ, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
 
 For the full voice feature set — including CLI microphone mode, spoken replies in messaging, and Discord voice-channel conversations — see [Voice Mode](/docs/user-guide/features/voice-mode) and [Use Voice Mode with Hermes](/docs/guides/use-voice-mode-with-hermes).
 
@@ -24,6 +24,7 @@ For the full voice feature set — including CLI microphone mode, spoken replies
 | Home Assistant | — | — | — | — | — | — | — |
 | Mattermost | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
 | Matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| MAX | — | — | — | — | — | ✅ | ✅ |
 | DingTalk | — | ✅ | ✅ | — | ✅ | — | ✅ |
 | Feishu/Lark | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | WeCom | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
@@ -50,6 +51,7 @@ flowchart TB
             ha[Home Assistant]
             mm[Mattermost]
             mx[Matrix]
+            max[MAX]
             dt[DingTalk]
     fs[Feishu/Lark]
     wc[WeCom]
@@ -76,6 +78,7 @@ flowchart TB
     ha --> store
     mm --> store
     mx --> store
+    max --> store
     dt --> store
     fs --> store
     wc --> store
@@ -365,6 +368,7 @@ Each platform has its own toolset:
 | Home Assistant | `hermes-homeassistant` | Full tools + HA device control (ha_list_entities, ha_get_state, ha_call_service, ha_list_services) |
 | Mattermost | `hermes-mattermost` | Full tools including terminal |
 | Matrix | `hermes-matrix` | Full tools including terminal |
+| MAX | `hermes-max` | Full tools including terminal |
 | DingTalk | `hermes-dingtalk` | Full tools including terminal |
 | Feishu/Lark | `hermes-feishu` | Full tools including terminal |
 | WeCom | `hermes-wecom` | Full tools including terminal |
@@ -387,6 +391,7 @@ Each platform has its own toolset:
 - [Home Assistant Integration](homeassistant.md)
 - [Mattermost Setup](mattermost.md)
 - [Matrix Setup](matrix.md)
+- [MAX Setup](max.md)
 - [DingTalk Setup](dingtalk.md)
 - [Feishu/Lark Setup](feishu.md)
 - [WeCom Setup](wecom.md)

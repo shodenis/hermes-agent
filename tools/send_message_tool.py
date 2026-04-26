@@ -120,7 +120,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'max:-1001234567890'"
             },
             "message": {
                 "type": "string",
@@ -215,6 +215,7 @@ def _handle_send(args):
         "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "max": Platform.MAX,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -411,6 +412,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
     from gateway.platforms.discord import DiscordAdapter
+    from gateway.platforms.max import MAX_MESSAGE_LENGTH
     from gateway.platforms.slack import SlackAdapter
 
     # Telegram adapter import is optional (requires python-telegram-bot)
@@ -441,6 +443,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
         Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
+        Platform.MAX: MAX_MESSAGE_LENGTH,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
@@ -571,6 +574,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
+        elif platform == Platform.MAX:
+            result = await _send_max(pconfig.token, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -1508,6 +1513,40 @@ async def _send_qqbot(pconfig, chat_id, message):
                 return _error(f"QQBot send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
+
+
+async def _send_max(token, chat_id, message):
+    """Send via MAX Bot API."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    try:
+        headers = {
+            "Authorization": token or os.getenv("MAX_BOT_TOKEN", ""),
+            "Content-Type": "application/json",
+        }
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.post(
+                "https://platform-api.max.ru/messages",
+                headers=headers,
+                params={"chat_id": chat_id},
+                json={"text": message, "notify": True},
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return _error(f"MAX API error ({resp.status}): {body}")
+                data = await resp.json()
+        msg = data.get("message") if isinstance(data, dict) else None
+        message_id = ""
+        if isinstance(msg, dict):
+            message_id = str(msg.get("mid", ""))
+        elif isinstance(data, dict):
+            message_id = str(data.get("message_id", ""))
+        return {"success": True, "platform": "max", "chat_id": chat_id, "message_id": message_id}
+    except Exception as exc:
+        return _error(f"MAX send failed: {exc}")
 
 
 # --- Registry ---

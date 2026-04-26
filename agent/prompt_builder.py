@@ -363,6 +363,13 @@ PLATFORM_HINTS = {
         "only — no markdown, no formatting. SMS messages are limited to ~1600 "
         "characters, so be brief and direct."
     ),
+    "max": (
+        "You are on MAX (max.ru / VK Teams). "
+        "Please do not use markdown as it does not render consistently. "
+        "Use concise plain text and avoid decorative formatting. "
+        "To send messages to another chat, use send_message with "
+        "target='max:CHAT_ID'."
+    ),
     "bluebubbles": (
         "You are chatting via iMessage (BlueBubbles). iMessage does not render "
         "markdown formatting — use plain text. Keep responses concise as they "
